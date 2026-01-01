@@ -1,0 +1,14 @@
+[Unit]
+Description=Hermes Zulip bridge
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{WORKDIR}}
+EnvironmentFile={{ENV_FILE}}
+ExecStart={{PYTHON}} -m hermes_zulip_bridge --config {{CONFIG}} bridge
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,24 @@
+instance_name: hermes
+agent_name: Hermes
+hermes:
+  command: hermes
+  profile: default
+  working_directory: .
+  timeout_seconds: 1800
+zulip:
+  site: https://zulip.example.com
+  bot_email_env: ZULIP_BOT_EMAIL
+  bot_api_key_env: ZULIP_BOT_API_KEY
+  stream: hermes
+  stream_id: 12345
+bridge:
+  state_directory: ~/.hermes/state
+  steering_sidecar_path: ~/.hermes/state/steering.jsonl
+  poll_interval: 5
+  workers: 2
+response:
+  max_message_size: 9000
+notifier:
+  agentos_url: http://127.0.0.1:9120
+  board: default
+  poll_interval: 30

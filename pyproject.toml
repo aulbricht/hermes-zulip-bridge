@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-zulip-bridge"
+version = "0.1.0"
+description = "Configurable Zulip bridge and Kanban notifier for Hermes instances."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6.0", "zulip>=0.9.1"]
+
+[project.scripts]
+hermes-zulip-bridge = "hermes_zulip_bridge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

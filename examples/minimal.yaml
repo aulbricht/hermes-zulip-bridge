@@ -1,0 +1,10 @@
+instance_name: hermes
+hermes:
+  command: hermes
+zulip:
+  site: https://example.zulip.com
+  bot_email_env: ZULIP_BOT_EMAIL
+  bot_api_key_env: ZULIP_BOT_API_KEY
+  stream: hermes
+bridge:
+  state_directory: ~/.hermes/state
