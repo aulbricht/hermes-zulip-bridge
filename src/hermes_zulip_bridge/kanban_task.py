@@ -9,9 +9,11 @@ terminal state.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,30 +25,55 @@ DEFAULT_BOARD = os.environ.get("HERMES_CODING_WORKFLOW_BOARD", "default")
 DEFAULT_ASSIGNEE = os.environ.get("HERMES_CODING_WORKFLOW_CODER", "coder")
 DEFAULT_REVIEWER = os.environ.get("HERMES_CODING_WORKFLOW_REVIEWER", "reviewer")
 DEFAULT_STREAM = os.environ.get("HERMES_ZULIP_STREAMS", os.environ.get("ZULIP_BRIDGE_STREAMS", "hermes")).split(",", 1)[0]
+DEFAULT_STREAM_ID = os.environ.get("HERMES_ZULIP_STREAM_IDS", "").split(",", 1)[0]
 DEFAULT_TOPIC = os.environ.get("HERMES_ZULIP_DEFAULT_TOPIC", os.environ.get("ZULIP_BRIDGE_DEFAULT_TOPIC", "Hermes bridge"))
 
 
-def request_json(method: str, url: str, *, payload: dict[str, Any] | None = None, timeout: float = 30) -> dict[str, Any]:
-    data = None
-    headers = {"User-Agent": "Hermes-Coding-Workflow-Creator"}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+class KanbanRequestError(RuntimeError):
+    pass
+
+
+def _request_error(operation: str, status: str) -> KanbanRequestError:
+    if operation not in {"request", "task creation", "task dispatch"}:
+        operation = "request"
+    if status not in {"request error", "invalid response"} and not (
+        status.startswith("HTTP ") and status[5:].isdigit()
+    ):
+        status = "request error"
+    reference = hashlib.sha256(f"{operation}:{status}".encode("ascii")).hexdigest()[:12]
+    return KanbanRequestError(f"Kanban {operation} failed ({status}; reference {reference})")
+
+
+def request_json(
+    method: str,
+    url: str,
+    *,
+    operation: str = "request",
+    payload: dict[str, Any] | None = None,
+    timeout: float = 30,
+) -> dict[str, Any]:
     try:
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {"User-Agent": "Hermes-Coding-Workflow-Creator"}
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"{method} {url} failed: HTTP {exc.code} {raw[:500]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"{method} {url} failed: {exc.reason}") from exc
+        status = f"HTTP {exc.code}" if type(exc.code) is int and 100 <= exc.code <= 599 else "request error"
+    except (UnicodeError, json.JSONDecodeError):
+        status = "invalid response"
+    except Exception:
+        status = "request error"
+    raise _request_error(operation, status)
 
 
 def build_task_body(args: argparse.Namespace) -> str:
     origin = {
         "platform": "zulip",
         "stream": args.stream,
+        "stream_id": getattr(args, "stream_id", None),
         "topic": args.topic,
         "message_id": args.message_id,
         "bridge_marker": args.bridge_marker,
@@ -111,6 +138,7 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
     notification_target = {
         "platform": "zulip",
         "stream": args.stream,
+        "stream_id": getattr(args, "stream_id", None),
         "topic": args.topic,
         "message_id": args.message_id,
         "bridge_marker": args.bridge_marker,
@@ -151,13 +179,13 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
 def create_task(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str, Any]:
     query = urllib.parse.urlencode({"board": args.board})
     url = f"{args.agentos_url.rstrip('/')}/api/plugins/kanban/tasks?{query}"
-    return request_json("POST", url, payload=payload)
+    return request_json("POST", url, operation="task creation", payload=payload)
 
 
 def dispatch(args: argparse.Namespace) -> dict[str, Any]:
     query = urllib.parse.urlencode({"board": args.board})
     url = f"{args.agentos_url.rstrip('/')}/api/plugins/kanban/dispatch?{query}"
-    return request_json("POST", url, payload={"board": args.board})
+    return request_json("POST", url, operation="task dispatch", payload={"board": args.board})
 
 
 def current_git_repo(default: str = "") -> str:
@@ -183,6 +211,7 @@ def main() -> int:
     parser.add_argument("--repo", default=current_git_repo(""), help="Repository/workspace path for the coder.")
     parser.add_argument("--acceptance", action="append", help="Acceptance criterion; may be repeated.")
     parser.add_argument("--stream", default=DEFAULT_STREAM)
+    parser.add_argument("--stream-id", type=int, default=int(DEFAULT_STREAM_ID) if DEFAULT_STREAM_ID.isdigit() else None)
     parser.add_argument("--topic", default=DEFAULT_TOPIC)
     parser.add_argument("--dm-to", default="", help="Send terminal workflow notifications as a Zulip direct message to this user/email/user-id instead of a stream topic.")
     parser.add_argument("--message-id", default="")
@@ -198,12 +227,16 @@ def main() -> int:
     args = parser.parse_args()
     payload = build_payload(args)
     if args.dry_run:
-        print(json.dumps({"ok": True, "payload": payload}, indent=2, sort_keys=True))
+        print(json.dumps({"ok": True, "payload_ready": True, "acceptance_count": len(args.acceptance or [])}, sort_keys=True))
         return 0
-    created = create_task(args, payload)
-    result = {"ok": True, "created": created}
-    if args.dispatch:
-        result["dispatch"] = dispatch(args)
+    try:
+        created = create_task(args, payload)
+        result = {"ok": True, "created": bool(created)}
+        if args.dispatch:
+            result["dispatched"] = bool(dispatch(args))
+    except KanbanRequestError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
