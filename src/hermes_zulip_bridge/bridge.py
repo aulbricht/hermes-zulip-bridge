@@ -2351,7 +2351,7 @@ def _signal_registered_descendants(proc: subprocess.Popen, sig: signal.Signals) 
     root_pid = strict_positive_int(getattr(proc, "pid", None))
     if root_pid is None:
         return
-    descendants = _snapshot_registered_descendants(proc)
+    descendants = _snapshot_registered_descendants(proc, require_registered=True)
     table = _local_process_table()
     current_group = os.getpgrp()
     live = {
@@ -2374,14 +2374,14 @@ def _signal_registered_descendants(proc: subprocess.Popen, sig: signal.Signals) 
 
 def _has_registered_descendants(proc: subprocess.Popen) -> bool:
     root_pid = strict_positive_int(getattr(proc, "pid", None))
-    return bool(root_pid and _snapshot_registered_descendants(proc))
+    return bool(root_pid and _snapshot_registered_descendants(proc, require_registered=True))
 
 
 def _registered_process_group_alive(proc: subprocess.Popen) -> bool:
     root_pid = strict_positive_int(getattr(proc, "pid", None))
     if root_pid is None:
         return False
-    descendants = _snapshot_registered_descendants(proc)
+    descendants = _snapshot_registered_descendants(proc, require_registered=True)
     table = _local_process_table()
     return any(
         pgid == root_pid
@@ -2591,7 +2591,11 @@ def terminate_process(proc: subprocess.Popen) -> bool:
         if pid is None or (not leader_alive and not _registered_process_group_alive(proc)):
             raise ProcessLookupError
         with ACTIVE_LOCK:
-            leader_birth = ACTIVE_PROCESS_IDENTITIES.get(pid, "")
+            leader_birth = (
+                ACTIVE_PROCESS_IDENTITIES.get(pid, "")
+                if _registered_process_unlocked(proc, pid)
+                else ""
+            )
         if not leader_birth or not _signal_group_if_current(proc, pid, leader_birth, signal.SIGTERM):
             raise ProcessLookupError
         _signal_registered_descendants(proc, signal.SIGTERM)
@@ -2628,7 +2632,11 @@ def _terminate_and_reap_process_group(
             if pid is None:
                 raise ProcessLookupError
             with ACTIVE_LOCK:
-                leader_birth = ACTIVE_PROCESS_IDENTITIES.get(pid, "")
+                leader_birth = (
+                    ACTIVE_PROCESS_IDENTITIES.get(pid, "")
+                    if _registered_process_unlocked(proc, pid)
+                    else ""
+                )
             if not leader_birth or not _signal_group_if_current(proc, pid, leader_birth, signal.SIGKILL):
                 raise ProcessLookupError
         except BaseException:

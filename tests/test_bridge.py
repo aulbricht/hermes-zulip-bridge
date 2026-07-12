@@ -3272,6 +3272,8 @@ with bridge.process_lock(Path(sys.argv[1])):
         original_killpg = bridge.os.killpg
         original_processes = dict(bridge.ACTIVE_PROCESSES)
         original_interrupts = dict(bridge.ACTIVE_INTERRUPTS)
+        original_descendants = dict(bridge.ACTIVE_DESCENDANTS)
+        original_identities = dict(bridge.ACTIVE_PROCESS_IDENTITIES)
 
         class FakeProc:
             pid = 12345
@@ -3284,6 +3286,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             bridge.ACTIVE_INTERRUPTS.clear()
             proc = FakeProc()
             bridge.ACTIVE_PROCESSES[777] = proc
+            bridge.ACTIVE_DESCENDANTS[12345] = set()
             bridge.ACTIVE_PROCESS_IDENTITIES[12345] = "birth"
             bridge.os.killpg = lambda pid, sig: calls.append((pid, sig))
 
@@ -3298,6 +3301,10 @@ with bridge.process_lock(Path(sys.argv[1])):
             bridge.ACTIVE_PROCESSES.update(original_processes)
             bridge.ACTIVE_INTERRUPTS.clear()
             bridge.ACTIVE_INTERRUPTS.update(original_interrupts)
+            bridge.ACTIVE_DESCENDANTS.clear()
+            bridge.ACTIVE_DESCENDANTS.update(original_descendants)
+            bridge.ACTIVE_PROCESS_IDENTITIES.clear()
+            bridge.ACTIVE_PROCESS_IDENTITIES.update(original_identities)
 
         self.assertEqual(calls, [(12345, bridge.signal.SIGTERM)])
 
@@ -4075,11 +4082,10 @@ with bridge.process_lock(Path(sys.argv[1])):
         self.assertEqual((bridge.ACTIVE_PROCESSES, bridge.ACTIVE_DESCENDANTS), ({}, {}))
         self.assertNotIn(77, bridge.ACTIVE_INTERRUPTS)
 
-    def test_real_process_group_cleanup_leaves_no_live_descendant(self) -> None:
+    def test_registered_process_group_cleanup_kills_child_after_leader_exits(self) -> None:
         child_code = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
         parent_code = (
-            "import signal,subprocess,sys,time; "
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "import subprocess,sys,time; "
             f"child=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
             "print(child.pid, flush=True); time.sleep(60)"
         )
@@ -4091,12 +4097,23 @@ with bridge.process_lock(Path(sys.argv[1])):
             start_new_session=True,
         )
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        bridge.register_active_process(990, proc)
         child_pid = int(proc.stdout.readline().strip())
+        child_birth = bridge._process_birth_identity(child_pid)
+        self.addCleanup(
+            lambda: bridge._signal_pid_if_current(
+                child_pid, proc.pid, child_birth, bridge.signal.SIGKILL
+            )
+        )
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and not bridge._has_registered_descendants(proc):
+            time.sleep(0.02)
 
         bridge.terminate_and_reap_process_group(proc, grace_seconds=0.05)
 
         self.assertIsNotNone(proc.poll())
         self.assertNotIn(proc.pid, bridge.ACTIVE_DESCENDANTS)
+        self.assertNotIn(990, bridge.ACTIVE_PROCESSES)
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             status = subprocess.run(
@@ -4106,6 +4123,57 @@ with bridge.process_lock(Path(sys.argv[1])):
                 break
             time.sleep(0.02)
         self.assertTrue(not status or status.startswith("Z"), f"descendant {child_pid} survived with status {status}")
+
+    def test_unregistered_cleanup_never_adopts_current_pid_or_descendants(self) -> None:
+        proc = mock.Mock(pid=41000, returncode=None)
+        proc.poll.return_value = None
+        proc.wait.side_effect = subprocess.TimeoutExpired("stale", 0)
+        proc.communicate.side_effect = subprocess.TimeoutExpired("stale", 0)
+        table = {
+            41000: (1, 41000, "replacement"),
+            41001: (41000, 41000, "replacement-child"),
+        }
+        with (
+            mock.patch.dict(bridge.ACTIVE_PROCESSES, {}, clear=True),
+            mock.patch.dict(bridge.ACTIVE_DESCENDANTS, {}, clear=True),
+            mock.patch.dict(bridge.ACTIVE_PROCESS_IDENTITIES, {}, clear=True),
+            mock.patch.object(bridge, "_local_process_table", return_value=table),
+            mock.patch.object(bridge.os, "killpg") as killpg,
+            mock.patch.object(bridge, "_signal_pid_if_current") as signal_pid,
+        ):
+            bridge._terminate_and_reap_process_group(proc, grace_seconds=0)
+        killpg.assert_not_called()
+        signal_pid.assert_not_called()
+        proc.terminate.assert_called_once_with()
+        proc.kill.assert_called_once_with()
+
+    def test_stale_unregistered_cleanup_cannot_borrow_replacement_registration(self) -> None:
+        replacement = mock.Mock(pid=41000, returncode=None)
+        replacement.poll.return_value = None
+        table = {41000: (1, 41000, "replacement")}
+
+        def stale_process() -> mock.Mock:
+            stale = mock.Mock(pid=41000, returncode=None)
+            stale.poll.return_value = None
+            stale.wait.side_effect = subprocess.TimeoutExpired("stale", 0)
+            stale.communicate.side_effect = subprocess.TimeoutExpired("stale", 0)
+            return stale
+
+        with (
+            mock.patch.dict(bridge.ACTIVE_PROCESSES, {77: replacement}, clear=True),
+            mock.patch.dict(bridge.ACTIVE_DESCENDANTS, {41000: set()}, clear=True),
+            mock.patch.dict(bridge.ACTIVE_PROCESS_IDENTITIES, {41000: "replacement"}, clear=True),
+            mock.patch.dict(bridge.ACTIVE_PROCESS_GROUP_IDENTITIES, {41000: "replacement"}, clear=True),
+            mock.patch.object(bridge, "_local_process_table", return_value=table),
+            mock.patch.object(bridge.os, "killpg") as killpg,
+        ):
+            term_stale = stale_process()
+            self.assertTrue(bridge.terminate_process(term_stale))
+            term_stale.terminate.assert_called_once_with()
+            kill_stale = stale_process()
+            bridge._terminate_and_reap_process_group(kill_stale, grace_seconds=0)
+            kill_stale.kill.assert_called_once_with()
+        killpg.assert_not_called()
 
     @unittest.skipUnless(sys.platform == "darwin", "Darwin kqueue regression")
     def test_no_waitid_late_child_created_at_leader_exit_is_cleaned(self) -> None:
@@ -7911,6 +7979,7 @@ with bridge.process_lock(Path(sys.argv[1])):
 
         with (
             mock.patch.dict(bridge.ACTIVE_PROCESSES, {1: proc}, clear=True),
+            mock.patch.dict(bridge.ACTIVE_DESCENDANTS, {proc.pid: set()}, clear=True),
             mock.patch.dict(bridge.ACTIVE_PROCESS_IDENTITIES, {proc.pid: "birth"}, clear=True),
             mock.patch.object(bridge.os, "killpg", side_effect=fake_killpg),
             mock.patch.object(
@@ -7954,6 +8023,11 @@ with bridge.process_lock(Path(sys.argv[1])):
 
         with (
             mock.patch.dict(bridge.ACTIVE_PROCESSES, {1: processes[0], 2: processes[1]}, clear=True),
+            mock.patch.dict(
+                bridge.ACTIVE_DESCENDANTS,
+                {processes[0].pid: set(), processes[1].pid: set()},
+                clear=True,
+            ),
             mock.patch.dict(
                 bridge.ACTIVE_PROCESS_IDENTITIES,
                 {processes[0].pid: "birth-1", processes[1].pid: "birth-2"},
@@ -9473,22 +9547,23 @@ with bridge.process_lock(Path(sys.argv[1])):
         finally:
             bridge.terminate_and_reap_process_group(proc, grace_seconds=0.05)
 
-        monitored = mock.Mock(pid=100)
-        monitored.poll.return_value = 0
-        queue = mock.Mock()
-        with (
-            mock.patch.object(bridge.sys, "platform", "darwin"),
-            mock.patch.object(bridge.select, "kqueue", return_value=queue),
-            mock.patch.object(bridge, "_snapshot_registered_descendants", return_value={(101, 101, "child")}),
-            mock.patch.object(
-                bridge, "_process_birth_identity", side_effect=lambda pid: "root" if pid == 100 else "child"
-            ),
-            mock.patch.dict(bridge.ACTIVE_DESCENDANTS, {100: set()}, clear=True),
-            mock.patch.dict(bridge.ACTIVE_PROCESS_IDENTITIES, {100: "root"}, clear=True),
-        ):
-            bridge._watch_registered_descendants(monitored)
-        self.assertTrue(queue.control.called)
-        queue.close.assert_called_once_with()
+        if hasattr(bridge.select, "kqueue"):
+            monitored = mock.Mock(pid=100)
+            monitored.poll.return_value = 0
+            queue = mock.Mock()
+            with (
+                mock.patch.object(bridge.sys, "platform", "darwin"),
+                mock.patch.object(bridge.select, "kqueue", return_value=queue),
+                mock.patch.object(bridge, "_snapshot_registered_descendants", return_value={(101, 101, "child")}),
+                mock.patch.object(
+                    bridge, "_process_birth_identity", side_effect=lambda pid: "root" if pid == 100 else "child"
+                ),
+                mock.patch.dict(bridge.ACTIVE_DESCENDANTS, {100: set()}, clear=True),
+                mock.patch.dict(bridge.ACTIVE_PROCESS_IDENTITIES, {100: "root"}, clear=True),
+            ):
+                bridge._watch_registered_descendants(monitored)
+            self.assertTrue(queue.control.called)
+            queue.close.assert_called_once_with()
 
     def test_resolve_session_rejects_missing_large_changed_reserved_and_unpublishable_routes(self) -> None:
         base = user_message(44, 1, "Topic")
