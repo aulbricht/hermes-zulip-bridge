@@ -5478,6 +5478,8 @@ def canonical_slash_command(name: str) -> str | None:
     clean = str(name or "").strip().lstrip("/").replace("_", "-").lower()
     if not clean:
         return None
+    if clean in KNOWN_SLASH_COMMAND_FALLBACK:
+        return clean
     try:
         from hermes_cli.commands import resolve_command
 
@@ -5486,7 +5488,7 @@ def canonical_slash_command(name: str) -> str | None:
             return str(command.name)
     except Exception:
         pass
-    return clean if clean in KNOWN_SLASH_COMMAND_FALLBACK else None
+    return None
 
 
 def slash_command_key(canonical: str, args: str) -> str:

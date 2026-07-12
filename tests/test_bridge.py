@@ -3529,12 +3529,13 @@ with bridge.process_lock(Path(sys.argv[1])):
                 self.assertIsNone(bridge.parse_known_slash_command(content))
         self.assertIsNone(bridge.parse_known_slash_command("/definitely-not-real"))
 
-    def test_parse_known_slash_command_uses_installed_registry_alias(self) -> None:
+    def test_parse_known_slash_command_keeps_package_names_stable_and_discovers_new_aliases(self) -> None:
         command = mock.Mock()
         command.name = "new"
         registry = mock.Mock(resolve_command=mock.Mock(return_value=command))
         with mock.patch.dict(sys.modules, {"hermes_cli.commands": registry}):
-            self.assertEqual(bridge.parse_known_slash_command("/reset now"), ("reset", "new", "now"))
+            self.assertEqual(bridge.parse_known_slash_command("/reset now"), ("reset", "reset", "now"))
+            self.assertEqual(bridge.parse_known_slash_command("/fresh now"), ("fresh", "new", "now"))
 
     def test_multiline_or_quoted_slash_text_stays_on_the_ordinary_prompt_path(self) -> None:
         for content in ("prose /reset", "quoted:\n> /status", "```text\n/reset\n```", "/goal status\nmore"):
