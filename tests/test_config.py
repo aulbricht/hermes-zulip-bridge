@@ -261,6 +261,21 @@ response:
         self.assertEqual(validate_config(disabled), [])
         self.assertEqual(bridge_config.apply_notifier_env(disabled)["HERMES_ZULIP_ALLOW_DMS"], "0")
 
+    def test_bridge_mention_switch_requires_an_actual_boolean_and_fails_closed(self) -> None:
+        base = {
+            "hermes": secure_hermes(),
+            "zulip": secure_zulip(zuliprc="/tmp/test.zuliprc"),
+        }
+        for value in ("", "false", "true", 0, 1, None, [], {}):
+            with self.subTest(value=value):
+                config = {**base, "bridge": {"require_mention": value}}
+                self.assertIn("bridge.require_mention must be a boolean", validate_config(config))
+                with self.assertRaisesRegex(ValueError, "bridge.require_mention must be a boolean"):
+                    apply_bridge_env(config)
+        disabled = {**base, "bridge": {"require_mention": False}}
+        self.assertEqual(validate_config(disabled), [])
+        self.assertEqual(apply_bridge_env(disabled)["HERMES_ZULIP_REQUIRE_MENTION"], "0")
+
     def test_notifier_exports_the_same_destination_and_sender_policy(self) -> None:
         config = {
             "hermes": secure_hermes(),

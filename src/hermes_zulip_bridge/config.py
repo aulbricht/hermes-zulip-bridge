@@ -172,6 +172,9 @@ def validate_config(config: dict[str, Any], *, require_secret: bool = False) -> 
         issues.append("bridge.privileged_senders is required when privileged_slash_commands is configured")
     if privileged_senders and not set(privileged_senders).issubset(set(allowed_senders)):
         issues.append("bridge.privileged_senders must be included in zulip.allowed_senders")
+    require_mention = bridge.get("require_mention", True)
+    if type(require_mention) is not bool:
+        issues.append("bridge.require_mention must be a boolean")
     notifier = _section(config, "notifier") or _section(config, "kanban")
     allow_direct_messages = notifier.get("allow_direct_messages", False)
     if type(allow_direct_messages) is not bool:
@@ -240,7 +243,7 @@ def apply_bridge_env(
     env["HERMES_ZULIP_ALLOWED_SENDERS"] = _csv(zulip.get("allowed_senders")) or ""
     env["HERMES_ZULIP_PRIVILEGED_SENDERS"] = _csv(bridge.get("privileged_senders")) or ""
     env["HERMES_ZULIP_PRIVILEGED_COMMANDS"] = _csv(bridge.get("privileged_slash_commands")) or ""
-    env["HERMES_ZULIP_REQUIRE_MENTION"] = "1" if bridge.get("require_mention", True) else "0"
+    env["HERMES_ZULIP_REQUIRE_MENTION"] = "0" if bridge.get("require_mention", True) is False else "1"
     env["HERMES_ZULIP_IGNORE_CONTENT_PATTERNS"] = "\n".join(_list(bridge.get("ignore_content_patterns"))) if bridge.get("ignore_content_patterns") is not None else ""
     env["HERMES_ZULIP_STEERING_REACTION"] = str(bridge.get("steering_reaction") or "eyes")
     env["HERMES_ZULIP_HARD_INTERRUPT"] = "1" if bridge.get("hard_interrupt_on_steering", True) else "0"
