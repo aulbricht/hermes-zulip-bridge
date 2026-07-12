@@ -22,4 +22,5 @@ jobs:
       - run: uv sync --frozen
       - run: |
           install -d -m 700 "$HOME/hermes-zulip-test-tmp"
-          TMPDIR="$HOME/hermes-zulip-test-tmp" uv run python -m unittest discover -s tests -p 'test_*.py'
+          install -m 500 "$(readlink -f .venv/bin/python)" .venv/bin/python-hermes-ci
+          TMPDIR="$HOME/hermes-zulip-test-tmp" .venv/bin/python-hermes-ci -m unittest discover -s tests -p 'test_*.py'
