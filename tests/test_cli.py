@@ -26,7 +26,13 @@ from hermes_zulip_bridge.locking import PROCESS_LOCK_FAILED, PROCESS_LOCK_UNAVAI
 
 class CliLockTests(unittest.TestCase):
     def write_config(self, path: Path, config: dict) -> None:
-        path.write_text(json.dumps(config), encoding="utf-8")
+        prepared = json.loads(json.dumps(config))
+        zulip = prepared.setdefault("zulip", {})
+        if isinstance(zulip, dict):
+            zulip.setdefault("allowed_senders", ["id:17"])
+            zulip.setdefault("stream_id", 7)
+            zulip.setdefault("topic_policy", "any")
+        path.write_text(json.dumps(prepared), encoding="utf-8")
         path.chmod(0o600)
 
     def trusted_venv_python(self, root: Path) -> Path:

@@ -6,12 +6,12 @@ A reusable Zulip bridge for Hermes.
 
 ## Features
 
-- Zulip stream/topic polling with optional stream ID filtering
-- Hermes command dispatch and Zulip reply posting
+- Zulip stream/topic polling with fail-closed sender and numeric stream authorization
+- Mention-gated Hermes command dispatch and Zulip reply posting
 - Stable Zulip topic/session mapping across channel renames
-- Mid-turn steering and interruption through same-topic Zulip messages
+- Same-sender mid-turn steering and interruption through same-topic Zulip messages
 - Authenticated Zulip upload downloads with temporary local attachment context for Hermes
-- Hermes slash-command routing for known slash commands
+- Read-only chat slash commands with an explicit privileged-command policy
 - `/goal` status/control support through Hermes goal state
 - Optional Kanban terminal-status notifications back to Zulip
 - YAML/JSON config with credentials from Zulip rc files or environment variables
@@ -27,7 +27,7 @@ python3 -m pip install -e .
 The package uses the official Zulip Python client:
 
 ```bash
-python3 -m pip install 'zulip>=0.9.1'
+python3 -m pip install 'zulip>=0.9.1,<1'
 ```
 
 ## Quick Start
@@ -38,7 +38,8 @@ Create an owner-only config file at `~/.config/hermes-zulip-bridge/service.yaml`
 instance_name: hermes
 hermes:
   command: hermes
-  profile: default
+  # Use a dedicated profile with the minimum tools and workspaces required by chat.
+  profile: restricted-chat
   working_directory: .
   # Optional names needed by a custom Hermes runtime; Zulip variables are always excluded.
   env_allowlist: [CUSTOM_RUNTIME_SETTING]
@@ -48,10 +49,17 @@ zulip:
   bot_api_key_env: ZULIP_BOT_API_KEY
   stream: hermes
   stream_id: 12345
+  allowed_senders: [id:42]
+  # Use `any` for dynamic per-session topics, or `allowlist` with topic_allowlist.
+  topic_policy: any
 bridge:
   state_directory: ~/.hermes/state
   # Exit after this many consecutive poll failures so the service manager can restart the bridge.
   poll_failure_limit: 10
+  require_mention: true
+  # Optional operator-only state-changing commands. Both lists are required together.
+  privileged_senders: [id:42]
+  privileged_slash_commands: [goal, stop]
 ```
 
 Set credentials:
@@ -75,7 +83,28 @@ PYTHONPATH=src python3 -m hermes_zulip_bridge --config ~/.config/hermes-zulip-br
 PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
+CI and reproducible deployments use the committed `uv.lock`:
+
+```bash
+uv sync --frozen
+uv run python -m unittest discover -s tests -p 'test_*.py'
+```
+
 `hermes.command` must resolve to an executable Python console script whose absolute shebang names Python inside a private virtual-environment `bin`. The bridge sends private prompt bytes through an inherited pipe and runs that script in-process so Zulip content never appears in process arguments. Launcher files and every executed path component must be owned by root or the bridge user and must not be group/world-writable. Immediately before launch, verified interpreter bytes are copied to a mode-`0500` private executable in that trusted `bin`; only the private copy is executed, so a package-manager source interpreter may live below a group-writable tree without becoming an executable pathname.
+
+## Security Policy
+
+The bridge fails closed unless `zulip.allowed_senders`, a positive numeric `zulip.stream_id`/`stream_ids`, and an explicit `zulip.topic_policy` are configured. Sender entries must use `id:<user-id>` or `email:<address>`; numeric user IDs are preferred. Environment-only installations can set the equivalent comma-separated `HERMES_ZULIP_ALLOWED_SENDERS` and `HERMES_ZULIP_STREAM_IDS` variables plus `HERMES_ZULIP_TOPIC_POLICY=any|allowlist`.
+
+Run the bridge only in a private, operator-only Zulip channel. New turns and slash commands require a direct `@` mention of the bot by default. While a turn is active, only the same authorized sender can steer or interrupt it without repeating the mention.
+
+Only exact `/status` and `/goal status` messages are chat-safe by default. State-changing slash commands are refused unless both the sender and command are explicitly listed under `bridge.privileged_senders` and `bridge.privileged_slash_commands`; `*` permits every known command for those privileged senders.
+
+The bridge fences chat, attachment, route, history, and steering text as untrusted prompt data and excludes non-allowlisted human messages from topic history. Fencing does not make a tool-capable model immune to prompt injection. Use a dedicated Hermes profile, OS account, container, or equivalent execution boundary that limits filesystem, process, and network capabilities to what chat-originated work actually needs.
+
+Notifier callbacks accept targets only from structured task metadata. Stream targets must match the configured numeric stream and sender policies. Direct messages are disabled by default; enable them with `notifier.allow_direct_messages: true` and a nonempty `notifier.allowed_dm_recipients` list of `id:`/`email:` identities.
+
+Version `0.2.0` is a breaking security release. Before restarting an existing service, add the sender, stream ID, topic, mention, slash-command, and notifier policies shown above and run `validate-config`. Legacy notifier tasks that carry callback targets only in free-text bodies are intentionally ignored; recreate them with structured `metadata.notification_target` or `source_detail.notification_target` fields.
 
 ## Commands
 
@@ -129,7 +158,7 @@ journalctl --user -u hermes-zulip-bridge -f
 
 Zulip upload links are private. The bridge rejects redirects, downloads attachments itself, inlines bounded text, and gives Hermes temporary owner-only local paths for image and other binary data. Zulip credentials and `zuliprc` paths are not included in prompts.
 
-Hermes children receive a small operational environment allowlist instead of the bridge process environment. Extra variable names can be listed in `hermes.env_allowlist`; Zulip credential and path variables remain blocked even when listed. This is secret minimization, not OS isolation: Hermes running as the same UID remains a trusted local execution boundary and can access files available to that account unless separate sandboxing is added.
+Hermes children receive a small operational environment allowlist instead of the bridge process environment. Extra variable names can be listed in `hermes.env_allowlist`; Zulip credential and path variables remain blocked even when listed. This is secret minimization, not OS isolation: Hermes running as the same UID can access files available to that account unless the configured Hermes profile or deployment supplies a separate sandbox.
 
 For channel-name resilience, prefer `zulip.stream_id` when configuring a bridge. Zulip channel names can change; stream IDs are stable.
 
@@ -149,6 +178,6 @@ The initial Zulip message poll is required for startup. After startup, successfu
 
 State and alias-manifest corruption is fatal at startup; existing bytes are never replaced with an empty default. External alias sessions must already be owned by the active realm-bound state, including legacy manifests without a realm field. Origin reservations are saved before Hermes starts. Bounded origin-retry and coordinator-only post-reconciliation queues use persisted capped backoff, so transient route failures survive the newest-message window and successful or uncertain answer posts are not repeated after restart.
 
-Each normal state file has an independent owner-only process-lock anchor. Existing owner-controlled state directories are upgraded to mode `0700`; parent-path aliases share one canonical anchor, while state-file symlinks, non-regular files, foreign owners, and multiply linked files are rejected. Accepted state files are repaired to mode `0600`, and replacement writes fsync both the private temporary file and containing directory. State, signing-key, steering, derived smoke-steering, alias-manifest, lock, Zulip credential, and Hermes SQLite paths must be canonically disjoint. Steering sidecars are securely appended, file-locked, deduplicated by Zulip message ID, and fsynced as owner-only `0600` files; first creation also fsyncs the containing directory. An existing alias manifest must also be a regular, owner-only, single-link `0600` file. Replacing the compatibility `.lock` pathname does not bypass a running bridge, and handed-off locks must nonblockingly re-establish their authoritative exclusive lock before bridge or smoke-test side effects begin.
+Each normal state file has an independent owner-only process-lock anchor. Existing owner-controlled state directories are upgraded to mode `0700`; parent-path aliases share one canonical anchor, while state-file symlinks, non-regular files, foreign owners, and multiply linked files are rejected. Accepted state files are repaired to mode `0600`, and replacement writes fsync both the private temporary file and containing directory. State, signing-key, steering, derived smoke-steering, alias-manifest, lock, Zulip credential, and Hermes SQLite paths must be canonically disjoint. Steering sidecars are scoped to one active turn, securely appended, file-locked, deduplicated by Zulip message ID, and fsynced as owner-only `0600` files in a `0700` directory. They are removed and the directory is fsynced when the turn ends. An existing alias manifest must also be a regular, owner-only, single-link `0600` file. Replacing the compatibility `.lock` pathname does not bypass a running bridge, and handed-off locks must nonblockingly re-establish their authoritative exclusive lock before bridge or smoke-test side effects begin.
 
 Hermes subprocess cleanup snapshots recursive same-UID descendants while the registered leader is alive and best-effort terminates detached descendant process groups and PIDs as well as the leader group. This is containment for accidental background children, not an OS sandbox: a trusted same-UID Hermes process can deliberately double-fork quickly enough to escape ancestry tracking and remains inside the trusted-Hermes limitation described above.

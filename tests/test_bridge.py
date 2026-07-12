@@ -76,7 +76,17 @@ class SequenceZulipClient:
 
 class ZulipAttachmentTests(unittest.TestCase):
     def setUp(self) -> None:
-        routes = mock.patch.multiple(bridge, ALLOW_STREAMS=set(), ALLOW_STREAM_IDS=set(), ALLOW_TOPICS=set())
+        routes = mock.patch.multiple(
+            bridge,
+            ALLOW_STREAMS=set(),
+            ALLOW_STREAM_IDS=set(),
+            ALLOW_TOPICS=set(),
+            TOPIC_POLICY="any",
+            ALLOWED_SENDERS={"id:17"},
+            PRIVILEGED_SENDERS=set(),
+            PRIVILEGED_SLASH_COMMANDS=set(),
+            REQUIRE_MENTION=False,
+        )
         routes.start()
         self.addCleanup(routes.stop)
         self.state_dir = tempfile.TemporaryDirectory()
@@ -1122,7 +1132,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                 bridge.add_reaction = fake_add_reaction
 
                 record = bridge.store_steering_message(rc, message, conversation, active_message_id=111)
-                lines = bridge.STEERING_PATH.read_text().splitlines()
+                lines = bridge.active_steering_path(111).read_text().splitlines()
         finally:
             bridge.STEERING_PATH = original_path
             bridge.add_reaction = original_add_reaction
@@ -1139,10 +1149,12 @@ with bridge.process_lock(Path(sys.argv[1])):
 
     def test_should_process_can_filter_topics(self) -> None:
         original_streams = bridge.ALLOW_STREAMS
+        original_stream_ids = bridge.ALLOW_STREAM_IDS
         original_topics = bridge.ALLOW_TOPICS
         original_patterns = bridge.IGNORE_CONTENT_PATTERNS
         try:
             bridge.ALLOW_STREAMS = set()
+            bridge.ALLOW_STREAM_IDS = {"1"}
             bridge.ALLOW_TOPICS = {"Allowed"}
             bridge.IGNORE_CONTENT_PATTERNS = []
             self.assertTrue(
@@ -1153,6 +1165,8 @@ with bridge.process_lock(Path(sys.argv[1])):
                         "display_recipient": "hermes",
                         "topic": "Allowed",
                         "sender_email": "user@example.com",
+                        "sender_id": 17,
+                        "sender_is_bot": False,
                         "content": "hello",
                     },
                     "bot@example.com",
@@ -1166,6 +1180,8 @@ with bridge.process_lock(Path(sys.argv[1])):
                         "display_recipient": "hermes",
                         "topic": "Blocked",
                         "sender_email": "user@example.com",
+                        "sender_id": 17,
+                        "sender_is_bot": False,
                         "content": "hello",
                     },
                     "bot@example.com",
@@ -1173,6 +1189,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             )
         finally:
             bridge.ALLOW_STREAMS = original_streams
+            bridge.ALLOW_STREAM_IDS = original_stream_ids
             bridge.ALLOW_TOPICS = original_topics
             bridge.IGNORE_CONTENT_PATTERNS = original_patterns
 
@@ -1188,11 +1205,13 @@ with bridge.process_lock(Path(sys.argv[1])):
             "display_recipient": "hermes",
             "topic": "✔ Allowed",
             "sender_email": "user@example.com",
+            "sender_id": 17,
+            "sender_is_bot": False,
             "content": "hello",
         }
         with (
             mock.patch.object(bridge, "ALLOW_STREAMS", set()),
-            mock.patch.object(bridge, "ALLOW_STREAM_IDS", set()),
+            mock.patch.object(bridge, "ALLOW_STREAM_IDS", {"1"}),
             mock.patch.object(bridge, "ALLOW_TOPICS", {"Allowed"}),
             mock.patch.object(bridge, "IGNORE_CONTENT_PATTERNS", []),
         ):
@@ -1205,11 +1224,13 @@ with bridge.process_lock(Path(sys.argv[1])):
             "display_recipient": "hermes",
             "topic": "Allowed",
             "sender_email": "user@example.com",
+            "sender_id": 17,
+            "sender_is_bot": False,
             "content": "hello",
         }
         with (
             mock.patch.object(bridge, "ALLOW_STREAMS", set()),
-            mock.patch.object(bridge, "ALLOW_STREAM_IDS", set()),
+            mock.patch.object(bridge, "ALLOW_STREAM_IDS", {"1"}),
             mock.patch.object(bridge, "ALLOW_TOPICS", {"✔ Allowed"}),
             mock.patch.object(bridge, "IGNORE_CONTENT_PATTERNS", []),
         ):
@@ -1229,6 +1250,8 @@ with bridge.process_lock(Path(sys.argv[1])):
                         "display_recipient": "new-name",
                         "topic": "Allowed",
                         "sender_email": "user@example.com",
+                        "sender_id": 17,
+                        "sender_is_bot": False,
                         "content": "hello",
                     },
                     "bot@example.com",
@@ -1242,6 +1265,8 @@ with bridge.process_lock(Path(sys.argv[1])):
                         "display_recipient": "old-name",
                         "topic": "Allowed",
                         "sender_email": "user@example.com",
+                        "sender_id": 17,
+                        "sender_is_bot": False,
                         "content": "hello",
                     },
                     "bot@example.com",
@@ -1250,6 +1275,81 @@ with bridge.process_lock(Path(sys.argv[1])):
         finally:
             bridge.ALLOW_STREAMS = original_streams
             bridge.ALLOW_STREAM_IDS = original_stream_ids
+
+    def test_admission_policy_fails_closed_and_requires_allowed_sender(self) -> None:
+        message = user_message(1, 7, "Topic")
+        with mock.patch.multiple(
+            bridge,
+            ALLOW_STREAMS=set(),
+            ALLOW_STREAM_IDS=set(),
+            ALLOW_TOPICS=set(),
+            TOPIC_POLICY="",
+            ALLOWED_SENDERS=set(),
+        ):
+            self.assertFalse(bridge.should_process(message, "bot@example.com"))
+        with mock.patch.multiple(
+            bridge,
+            ALLOW_STREAM_IDS={"7"},
+            ALLOW_TOPICS=set(),
+            TOPIC_POLICY="any",
+            ALLOWED_SENDERS={"id:18"},
+        ):
+            self.assertFalse(bridge.should_process(message, "bot@example.com"))
+        with mock.patch.multiple(
+            bridge,
+            ALLOW_STREAM_IDS={"7"},
+            ALLOW_TOPICS=set(),
+            TOPIC_POLICY="any",
+            ALLOWED_SENDERS={"id:17"},
+        ):
+            self.assertTrue(bridge.should_process(message, "bot@example.com"))
+
+    def test_direct_bot_mention_is_server_flagged_and_removed_from_payload(self) -> None:
+        direct = user_message(1, 7, "Topic", content="@**Hermes** /goal status")
+        direct["flags"] = ["mentioned"]
+        direct["_zulip_bot_name"] = "Hermes"
+        group = {**direct, "content": "@*operators* /goal status"}
+        unflagged = {**direct, "flags": []}
+
+        self.assertTrue(bridge.message_directly_mentions_bot(direct, "Hermes"))
+        self.assertEqual(bridge.effective_message_content(direct), "/goal status")
+        self.assertFalse(bridge.message_directly_mentions_bot(group, "Hermes"))
+        self.assertFalse(bridge.message_directly_mentions_bot(unflagged, "Hermes"))
+        with mock.patch.object(bridge, "REQUIRE_MENTION", True):
+            self.assertTrue(bridge.message_can_activate(direct))
+            self.assertFalse(bridge.message_can_activate(unflagged))
+            self.assertTrue(bridge.message_can_activate(unflagged, user_message(2, 7, "Topic")))
+            self.assertFalse(
+                bridge.message_can_activate(
+                    {**unflagged, "sender_id": 18, "sender_email": "other@example.com"},
+                    user_message(2, 7, "Topic"),
+                )
+            )
+
+    def test_slash_policy_denies_unauthorized_and_state_changing_commands_before_worker(self) -> None:
+        worker = mock.Mock(return_value="ok")
+        allowed = user_message(1, 7, "Topic", content="/status")
+        dangerous = user_message(2, 7, "Topic", content="/reset")
+        unauthorized = {**allowed, "sender_id": 18, "sender_email": "other@example.com"}
+        with mock.patch.object(bridge, "run_slash_worker", worker):
+            self.assertEqual(bridge.hermes_slash_reply({}, allowed, "s1"), ("ok", "s1"))
+            self.assertEqual(
+                bridge.hermes_slash_reply({}, dangerous, "s1"),
+                ("That slash command is not allowed from Zulip.", "s1"),
+            )
+            self.assertEqual(
+                bridge.hermes_slash_reply({}, unauthorized, "s1"),
+                ("That slash command is not allowed from Zulip.", "s1"),
+            )
+        worker.assert_called_once()
+
+        with (
+            mock.patch.object(bridge, "PRIVILEGED_SENDERS", {"id:17"}),
+            mock.patch.object(bridge, "PRIVILEGED_SLASH_COMMANDS", {"reset"}),
+            mock.patch.object(bridge, "run_slash_worker", return_value="reset") as privileged,
+        ):
+            self.assertEqual(bridge.hermes_slash_reply({}, dangerous, "s1"), ("reset", "s1"))
+        privileged.assert_called_once()
 
     def test_reply_uses_numeric_stream_id_across_stream_rename(self) -> None:
         posts: list[dict] = []
@@ -3037,6 +3137,7 @@ with bridge.process_lock(Path(sys.argv[1])):
 
     def test_should_process_uses_configurable_ignore_patterns(self) -> None:
         original_streams = bridge.ALLOW_STREAMS
+        original_stream_ids = bridge.ALLOW_STREAM_IDS
         original_topics = bridge.ALLOW_TOPICS
         original_patterns = bridge.IGNORE_CONTENT_PATTERNS
         message = {
@@ -3045,10 +3146,13 @@ with bridge.process_lock(Path(sys.argv[1])):
             "display_recipient": "hermes",
             "topic": "Allowed",
             "sender_email": "user@example.com",
+            "sender_id": 17,
+            "sender_is_bot": False,
             "content": "archive-import: archived note",
         }
         try:
             bridge.ALLOW_STREAMS = set()
+            bridge.ALLOW_STREAM_IDS = {"1"}
             bridge.ALLOW_TOPICS = set()
             bridge.IGNORE_CONTENT_PATTERNS = []
             self.assertTrue(bridge.should_process(message, "bot@example.com"))
@@ -3056,6 +3160,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             self.assertFalse(bridge.should_process(message, "bot@example.com"))
         finally:
             bridge.ALLOW_STREAMS = original_streams
+            bridge.ALLOW_STREAM_IDS = original_stream_ids
             bridge.ALLOW_TOPICS = original_topics
             bridge.IGNORE_CONTENT_PATTERNS = original_patterns
 
@@ -3452,7 +3557,7 @@ with bridge.process_lock(Path(sys.argv[1])):
 
             bridge.handle_message(
                 {"site": "https://zulip.example.com", "email": "bot@example.com", "key": "test-api-key"},
-                {"id": 1, "stream_id": 1, "display_recipient": "hermes", "topic": "t", "content": "/status"},
+                user_message(1, 1, "t", stream="hermes", content="/status"),
                 "s1",
             )
         finally:
@@ -3472,6 +3577,9 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "stream-1",
             "topic": "Topic",
+            "sender_id": 17,
+            "sender_email": "user@example.com",
+            "sender_is_bot": False,
             "content": "/status",
             "_zulip_state": state,
             "_zulip_bridge": {**source, "session_id": "s1"},
@@ -9693,8 +9801,26 @@ with bridge.process_lock(Path(sys.argv[1])):
         api = mock.Mock(
             return_value=zulip_success(
                 messages=[
-                    {"id": 9, "type": "stream", "stream_id": 7, "topic": "Topic", "content": " prior text "},
-                    {"id": 10, "type": "stream", "stream_id": 7, "subject": "Topic", "content": "current"},
+                    {
+                        "id": 9,
+                        "type": "stream",
+                        "stream_id": 7,
+                        "topic": "Topic",
+                        "sender_id": 17,
+                        "sender_email": "user@example.com",
+                        "sender_is_bot": False,
+                        "content": " prior text ",
+                    },
+                    {
+                        "id": 10,
+                        "type": "stream",
+                        "stream_id": 7,
+                        "subject": "Topic",
+                        "sender_id": 17,
+                        "sender_email": "user@example.com",
+                        "sender_is_bot": False,
+                        "content": "current",
+                    },
                 ]
             )
         )
@@ -9708,6 +9834,41 @@ with bridge.process_lock(Path(sys.argv[1])):
             json.loads(params["narrow"]),
             [{"operator": "channel", "operand": "hermes"}, {"operator": "topic", "operand": "Topic"}],
         )
+
+    def test_topic_history_excludes_non_allowlisted_humans_and_other_bots(self) -> None:
+        origin = {"id": 10, "type": "stream", "stream_id": 7, "display_recipient": "hermes", "topic": "Topic"}
+        base = {"type": "stream", "stream_id": 7, "topic": "Topic"}
+        messages = [
+            {**base, "id": 7, "sender_id": 18, "sender_email": "other@example.com", "sender_is_bot": False, "content": "inject"},
+            {**base, "id": 8, "sender_id": 50, "sender_email": "other-bot@example.com", "sender_is_bot": True, "content": "bot inject"},
+            {**base, "id": 9, "sender_id": 17, "sender_email": "user@example.com", "sender_is_bot": False, "content": "authorized"},
+        ]
+        with mock.patch.object(bridge, "api", return_value=zulip_success(messages=messages)):
+            history = bridge.topic_history({"email": "bot@example.com"}, origin)
+        self.assertEqual(history, "- user@example.com: authorized")
+        self.assertNotIn("inject", history)
+
+    def test_active_sidecar_is_private_scoped_and_removed_after_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            root.chmod(0o755)
+            with mock.patch.object(bridge, "STEERING_PATH", root / "steering.jsonl"):
+                path = bridge.active_steering_path(111)
+                bridge.append_steering_message(
+                    path,
+                    {"conversation_key": "key", "thread_id": "thread", "stream_id": "7", "topic": "Topic"},
+                    user_message(222, 7, "Topic", content="change course"),
+                    111,
+                )
+                self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertNotEqual(path, bridge.active_steering_path(112))
+                bridge.remove_active_steering_path(111)
+                self.assertFalse(path.exists())
+                bridge.STEERING_PATH.write_text("legacy plaintext", encoding="utf-8")
+                bridge.STEERING_PATH.chmod(0o644)
+                bridge.retire_legacy_steering_path()
+                self.assertFalse(bridge.STEERING_PATH.exists())
 
     def test_soft_steering_append_is_the_exactly_once_delivery_contract(self) -> None:
         active: dict = {}
@@ -11144,6 +11305,7 @@ with bridge.process_lock(Path(sys.argv[1])):
         with (
             mock.patch.object(bridge, "HERMES", script),
             mock.patch.object(bridge, "HERMES_EXTRA_ARGS", ["--profile", "fixture"]),
+            mock.patch.object(bridge, "RC_PATH", Path("/private/credentials/zuliprc")),
             mock.patch.object(bridge, "refresh_generation_origin"),
             mock.patch.object(bridge, "build_attachment_context", return_value="\nprivate attachment text"),
             mock.patch.object(bridge, "topic_history", return_value="private topic history"),
@@ -11153,7 +11315,11 @@ with bridge.process_lock(Path(sys.argv[1])):
             mock.patch.object(bridge, "merge_session_into", return_value="s1") as merge,
             mock.patch.object(bridge, "set_session_archived"),
         ):
-            answer, session_id = bridge.hermes_reply({}, message, "s1")
+            answer, session_id = bridge.hermes_reply(
+                {"site": "https://zulip.example.com", "email": "bot@example.com", "key": "secret-api-key"},
+                message,
+                "s1",
+            )
         result = json.loads(answer)
         self.assertEqual(session_id, "s1")
         self.assertEqual(
@@ -11168,6 +11334,12 @@ with bridge.process_lock(Path(sys.argv[1])):
             "private topic history",
         ):
             self.assertIn(private, result["prompt"])
+        self.assertLess(
+            result["prompt"].index("Hermes bridge trusted instructions:"),
+            result["prompt"].index("private message body"),
+        )
+        self.assertNotIn("/private/credentials/zuliprc", result["prompt"])
+        self.assertNotIn("secret-api-key", result["prompt"])
         clean.assert_called_once()
         merge.assert_called_once()
 

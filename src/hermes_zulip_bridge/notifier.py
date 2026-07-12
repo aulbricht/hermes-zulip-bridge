@@ -128,7 +128,8 @@ def _authorize_stream(stream_id: int, topic: str | None = None) -> None:
     topics = _policy_values("HERMES_ZULIP_TOPICS", "ZULIP_BRIDGE_TOPICS")
     if topic is None:
         return
-    if topic not in topics:
+    canonical = lambda value: str(value or "").strip().removeprefix("✔ ").strip()
+    if canonical(topic) not in {canonical(value) for value in topics}:
         raise RouteError("Zulip topic destination is denied")
 
 

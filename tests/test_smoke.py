@@ -44,6 +44,14 @@ def stream_message(
 
 class SmokeTests(unittest.TestCase):
     def setUp(self) -> None:
+        policy = mock.patch.multiple(
+            smoke.bridge,
+            ALLOWED_SENDERS={"id:17"},
+            TOPIC_POLICY="any",
+            REQUIRE_MENTION=False,
+        )
+        policy.start()
+        self.addCleanup(policy.stop)
         self.state_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.state_dir.cleanup)
         state_patch = mock.patch.object(smoke.bridge, "STATE_PATH", Path(self.state_dir.name) / "state.json")
@@ -1315,6 +1323,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                 "incomplete sender identity",
             ),
             "moved-route": (456, stream_message(456, "human", topic="Moved"), "requested stream/topic"),
+            "unmentioned": (456, stream_message(456, "human"), "does not directly mention"),
         }
         for label, (human_id, human, error) in cases.items():
             with self.subTest(case=label), tempfile.TemporaryDirectory() as tmpdir:
@@ -1362,6 +1371,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                     ALLOW_STREAMS={"hermes"},
                     ALLOW_STREAM_IDS={"7"},
                     ALLOW_TOPICS={"Smoke"},
+                    REQUIRE_MENTION=label == "unmentioned",
                 ), self.assertRaisesRegex(SystemExit, error):
                     smoke.run(
                         argparse.Namespace(

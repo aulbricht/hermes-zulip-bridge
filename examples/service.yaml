@@ -2,7 +2,7 @@ instance_name: hermes
 agent_name: Hermes
 hermes:
   command: hermes
-  profile: default
+  profile: restricted-chat
   working_directory: .
   timeout_seconds: 1800
 zulip:
@@ -11,14 +11,18 @@ zulip:
   bot_api_key_env: ZULIP_BOT_API_KEY
   stream: hermes
   stream_id: 12345
+  allowed_senders: [id:42]
+  topic_policy: any
 bridge:
   state_directory: ~/.hermes/state
   steering_sidecar_path: ~/.hermes/state/steering.jsonl
   poll_interval: 5
   workers: 2
+  require_mention: true
 response:
   max_message_size: 9000
 notifier:
   agentos_url: http://127.0.0.1:9120
   board: default
   poll_interval: 30
+  allow_direct_messages: false

@@ -21,6 +21,15 @@ def write_private(path: Path, content: str | bytes) -> None:
     path.chmod(0o600)
 
 
+def secure_zulip(**values: object) -> dict[str, object]:
+    return {
+        "allowed_senders": ["id:17"],
+        "stream_id": 7,
+        "topic_policy": "any",
+        **values,
+    }
+
+
 class ConfigTests(unittest.TestCase):
     def test_secure_config_file_matrix_and_replacement_detection(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -143,6 +152,8 @@ zulip:
   bot_api_key_env: ZULIP_TEST_KEY
   stream: hermes
   stream_id: 12345
+  allowed_senders:
+    - id:17
   topic_allowlist:
     - Staging
 bridge:
@@ -163,6 +174,9 @@ response:
                 self.assertEqual(env["HERMES_ZULIP_STREAMS"], "hermes")
                 self.assertEqual(env["HERMES_ZULIP_STREAM_IDS"], "12345")
                 self.assertEqual(env["HERMES_ZULIP_TOPICS"], "Staging")
+                self.assertEqual(env["HERMES_ZULIP_TOPIC_POLICY"], "allowlist")
+                self.assertEqual(env["HERMES_ZULIP_ALLOWED_SENDERS"], "id:17")
+                self.assertEqual(env["HERMES_ZULIP_REQUIRE_MENTION"], "1")
                 self.assertEqual(env["HERMES_ZULIP_IGNORE_CONTENT_PATTERNS"], "")
                 self.assertEqual(env["HERMES_ZULIP_STEERING_REACTION"], "eyes")
                 self.assertEqual(env["HERMES_ZULIP_HARD_INTERRUPT"], "1")
@@ -182,11 +196,50 @@ response:
         self.assertIn("hermes.command is required", issues)
         self.assertIn("zulip.bot_email or zulip.bot_email_env is required unless zulip.zuliprc is set", issues)
         self.assertIn("zulip.bot_api_key_env is required unless zulip.zuliprc is set", issues)
+        self.assertIn("zulip.allowed_senders must contain at least one id:<user-id> or email:<address>", issues)
+        self.assertIn("zulip.stream_id or zulip.stream_ids is required", issues)
+        self.assertIn("zulip.topic_policy must be 'any' or 'allowlist'", issues)
+
+    def test_security_policy_rejects_malformed_senders_streams_and_empty_topic_allowlist(self) -> None:
+        base = {"hermes": {"command": "/bin/true"}, "zulip": {"zuliprc": "/tmp/test.zuliprc"}}
+        issues = validate_config(
+            {
+                **base,
+                "zulip": {
+                    **base["zulip"],
+                    "allowed_senders": ["user@example.com", "id:0"],
+                    "stream_ids": [0, "nope"],
+                    "topic_policy": "allowlist",
+                },
+            }
+        )
+        self.assertIn("zulip.allowed_senders entries must use id:<user-id> or email:<address>", issues)
+        self.assertIn("zulip.stream_id values must be positive integers", issues)
+        self.assertIn("zulip.topic_allowlist is required when topic_policy is 'allowlist'", issues)
+
+    def test_notifier_exports_the_same_destination_and_sender_policy(self) -> None:
+        config = {
+            "hermes": {"command": "/bin/true"},
+            "zulip": secure_zulip(zuliprc="/tmp/test.zuliprc"),
+            "notifier": {
+                "allow_direct_messages": True,
+                "allowed_dm_recipients": ["id:42", "email:operator@example.com"],
+            },
+        }
+        env = bridge_config.apply_notifier_env(config)
+        self.assertEqual(env["HERMES_ZULIP_ALLOWED_SENDERS"], "id:17")
+        self.assertEqual(env["HERMES_ZULIP_STREAM_IDS"], "7")
+        self.assertEqual(env["HERMES_ZULIP_TOPIC_POLICY"], "any")
+        self.assertEqual(env["HERMES_ZULIP_ALLOW_DMS"], "1")
+        self.assertEqual(
+            env["HERMES_ZULIP_ALLOWED_DM_RECIPIENTS"],
+            "id:42,email:operator@example.com",
+        )
 
     def test_poll_failure_limit_is_configurable_and_must_be_positive_integer(self) -> None:
         base = {
             "hermes": {"command": "/bin/true"},
-            "zulip": {"zuliprc": "/tmp/test.zuliprc"},
+            "zulip": secure_zulip(zuliprc="/tmp/test.zuliprc"),
         }
         for value in (0, -1, True, 1.5, "3"):
             with self.subTest(value=value):
@@ -204,7 +257,7 @@ response:
             config = {
                 "instance_name": "My Bridge",
                 "hermes": {"command": "/bin/true"},
-                "zulip": {"zuliprc": "/tmp/test.zuliprc"},
+                "zulip": secure_zulip(zuliprc="/tmp/test.zuliprc"),
                 "bridge": {"state_directory": str(state_dir)},
             }
 
@@ -230,7 +283,7 @@ response:
             base = {
                 "instance_name": "bridge",
                 "hermes": {"command": "/bin/true"},
-                "zulip": {"zuliprc": "/tmp/test.zuliprc"},
+                "zulip": secure_zulip(zuliprc="/tmp/test.zuliprc"),
                 "bridge": {"state_directory": str(current)},
             }
 
@@ -270,11 +323,11 @@ response:
             config = {
                 "instance_name": "safe",
                 "hermes": {"command": "/bin/true"},
-                "zulip": {
+                "zulip": secure_zulip(**{
                     "site": "https://zulip.example.com",
                     "bot_email": "bot@example.com",
                     "bot_api_key_env": "TEST_ZULIP_KEY",
-                },
+                }),
                 "bridge": {"state_directory": str(state_dir)},
             }
 
@@ -291,11 +344,11 @@ response:
     def test_all_configured_credential_source_names_are_exported_for_child_blocking(self) -> None:
         config = {
             "hermes": {"command": "/bin/true", "env_allowlist": ["REALM_URL", "BOT_LOGIN", "BOT_TOKEN"]},
-            "zulip": {
+            "zulip": secure_zulip(**{
                 "site_env": "REALM_URL",
                 "bot_email_env": "BOT_LOGIN",
                 "bot_api_key_env": "BOT_TOKEN",
-            },
+            }),
         }
         with mock.patch.dict(
             os.environ,

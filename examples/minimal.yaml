@@ -6,5 +6,9 @@ zulip:
   bot_email_env: ZULIP_BOT_EMAIL
   bot_api_key_env: ZULIP_BOT_API_KEY
   stream: hermes
+  stream_id: 12345
+  allowed_senders: [id:42]
+  topic_policy: any
 bridge:
   state_directory: ~/.hermes/state
+  require_mention: true

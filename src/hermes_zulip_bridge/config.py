@@ -91,6 +91,36 @@ def validate_config(config: dict[str, Any], *, require_secret: bool = False) -> 
     ):
         issues.append("bridge.poll_failure_limit must be a positive integer")
     zulip = _section(config, "zulip")
+    allowed_senders = _list(zulip.get("allowed_senders"))
+    stream_ids = _list(zulip.get("stream_ids") or zulip.get("stream_id"))
+    topics = _list(zulip.get("topic_allowlist") or zulip.get("topics") or zulip.get("topic"))
+    topic_policy = str(zulip.get("topic_policy") or ("allowlist" if topics else "")).strip().lower()
+    if config and not allowed_senders:
+        issues.append("zulip.allowed_senders must contain at least one id:<user-id> or email:<address>")
+    if config and any(not _valid_sender(value) for value in allowed_senders):
+        issues.append("zulip.allowed_senders entries must use id:<user-id> or email:<address>")
+    if config and not stream_ids:
+        issues.append("zulip.stream_id or zulip.stream_ids is required")
+    if config and any(not str(value).isdigit() or int(str(value)) <= 0 for value in stream_ids):
+        issues.append("zulip.stream_id values must be positive integers")
+    if config and topic_policy not in {"any", "allowlist"}:
+        issues.append("zulip.topic_policy must be 'any' or 'allowlist'")
+    if config and topic_policy == "allowlist" and not topics:
+        issues.append("zulip.topic_allowlist is required when topic_policy is 'allowlist'")
+    privileged_senders = _list(bridge.get("privileged_senders"))
+    privileged_commands = _list(bridge.get("privileged_slash_commands"))
+    if any(not _valid_sender(value) for value in privileged_senders):
+        issues.append("bridge.privileged_senders entries must use id:<user-id> or email:<address>")
+    if privileged_commands and not privileged_senders:
+        issues.append("bridge.privileged_senders is required when privileged_slash_commands is configured")
+    if privileged_senders and not set(privileged_senders).issubset(set(allowed_senders)):
+        issues.append("bridge.privileged_senders must be included in zulip.allowed_senders")
+    notifier = _section(config, "notifier") or _section(config, "kanban")
+    dm_recipients = _list(notifier.get("allowed_dm_recipients"))
+    if notifier.get("allow_direct_messages", False) and not dm_recipients:
+        issues.append("notifier.allowed_dm_recipients is required when direct messages are enabled")
+    if any(not _valid_sender(value) for value in dm_recipients):
+        issues.append("notifier.allowed_dm_recipients entries must use id:<user-id> or email:<address>")
     has_zuliprc = bool(zulip.get("zuliprc") or zulip.get("rc_path"))
     key_env = str(zulip.get("bot_api_key_env") or zulip.get("api_key_env") or "").strip()
     if not has_zuliprc:
@@ -144,6 +174,13 @@ def apply_bridge_env(
     env["HERMES_ZULIP_STREAMS"] = _csv(zulip.get("streams") or zulip.get("stream")) or ""
     env["HERMES_ZULIP_STREAM_IDS"] = _csv(zulip.get("stream_ids") or zulip.get("stream_id")) or ""
     env["HERMES_ZULIP_TOPICS"] = _csv(zulip.get("topic_allowlist") or zulip.get("topics") or zulip.get("topic")) or ""
+    env["HERMES_ZULIP_TOPIC_POLICY"] = str(
+        zulip.get("topic_policy") or ("allowlist" if env["HERMES_ZULIP_TOPICS"] else "")
+    ).strip().lower()
+    env["HERMES_ZULIP_ALLOWED_SENDERS"] = _csv(zulip.get("allowed_senders")) or ""
+    env["HERMES_ZULIP_PRIVILEGED_SENDERS"] = _csv(bridge.get("privileged_senders")) or ""
+    env["HERMES_ZULIP_PRIVILEGED_COMMANDS"] = _csv(bridge.get("privileged_slash_commands")) or ""
+    env["HERMES_ZULIP_REQUIRE_MENTION"] = "1" if bridge.get("require_mention", True) else "0"
     env["HERMES_ZULIP_IGNORE_CONTENT_PATTERNS"] = "\n".join(_list(bridge.get("ignore_content_patterns"))) if bridge.get("ignore_content_patterns") is not None else ""
     env["HERMES_ZULIP_STEERING_REACTION"] = str(bridge.get("steering_reaction") or "eyes")
     env["HERMES_ZULIP_HARD_INTERRUPT"] = "1" if bridge.get("hard_interrupt_on_steering", True) else "0"
@@ -212,6 +249,16 @@ def apply_notifier_env(config: dict[str, Any], *, require_secret: bool = True, c
     _set(env, "HERMES_ZULIP_STREAMS", _csv(zulip.get("streams") or zulip.get("stream")))
     _set(env, "HERMES_ZULIP_STREAM_IDS", _csv(zulip.get("stream_ids") or zulip.get("stream_id")))
     _set(env, "HERMES_ZULIP_DEFAULT_TOPIC", zulip.get("default_topic") or zulip.get("topic"))
+    env["HERMES_ZULIP_TOPIC_POLICY"] = str(
+        zulip.get("topic_policy")
+        or ("allowlist" if zulip.get("topic_allowlist") or zulip.get("topics") or zulip.get("topic") else "")
+    ).strip().lower()
+    env["HERMES_ZULIP_TOPICS"] = _csv(
+        zulip.get("topic_allowlist") or zulip.get("topics") or zulip.get("topic")
+    ) or ""
+    env["HERMES_ZULIP_ALLOWED_SENDERS"] = _csv(zulip.get("allowed_senders")) or ""
+    env["HERMES_ZULIP_ALLOW_DMS"] = "1" if notifier.get("allow_direct_messages", False) else "0"
+    env["HERMES_ZULIP_ALLOWED_DM_RECIPIENTS"] = _csv(notifier.get("allowed_dm_recipients")) or ""
     env["HERMES_ZULIP_NOTIFIER_STATE"] = str(_path(notifier.get("state_path") or state_dir / f"{instance}_zulip_kanban_notifier.json"))
     _install_env(env)
     return env
@@ -308,6 +355,20 @@ def _csv(value: Any) -> str | None:
     if isinstance(value, list | tuple | set):
         return ",".join(str(item) for item in value if str(item).strip())
     return str(value)
+
+
+def _valid_sender(value: Any) -> bool:
+    text = str(value or "").strip()
+    if text.startswith("id:"):
+        return text[3:].isdigit() and int(text[3:]) > 0
+    if text.startswith("email:"):
+        address = text[6:].strip()
+        return bool(
+            address.count("@") == 1
+            and all(address.split("@"))
+            and not any(character.isspace() for character in address)
+        )
+    return False
 
 
 def _path(value: Any) -> Path:

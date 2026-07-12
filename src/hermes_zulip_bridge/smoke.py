@@ -210,6 +210,9 @@ def _run(args: argparse.Namespace, state_path: Path, hermes_launcher: LauncherPr
             raise SystemExit("Human smoke origin has incomplete sender identity or content") from exc
         if not bridge.should_process(human, str(rc.get("email") or "")):
             raise SystemExit("Human smoke origin is not an authorized human message")
+        if bridge.REQUIRE_MENTION and not bridge.message_directly_mentions_bot(human):
+            raise SystemExit("Human smoke origin does not directly mention the Zulip bot")
+        human["_zulip_bot_name"] = bridge.BOT_NAME
         if not bridge.allowed_stream_topic(human):
             raise SystemExit("Human smoke origin is outside the configured Zulip allowlist")
         if not isinstance(state, dict):
