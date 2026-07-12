@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import logging
+import os
 import tempfile
 import traceback
 import unittest
@@ -17,23 +18,40 @@ from hermes_zulip_bridge import notifier
 
 
 class ZulipKanbanNotifierTests(unittest.TestCase):
+    def setUp(self) -> None:
+        policy = mock.patch.dict(
+            os.environ,
+            {
+                "HERMES_ZULIP_STREAM_IDS": "7",
+                "HERMES_ZULIP_TOPIC_POLICY": "any",
+                "HERMES_ZULIP_TOPICS": "",
+                "HERMES_ZULIP_ALLOWED_SENDERS": "id:9,email:human@example.invalid",
+                "HERMES_ZULIP_ALLOW_DMS": "true",
+                "HERMES_ZULIP_ALLOWED_DM_RECIPIENTS": "id:123,id:456,email:user@example.com",
+            },
+        )
+        policy.start()
+        self.addCleanup(policy.stop)
+
     def test_flatten_tasks_propagates_column_status(self) -> None:
         board = {"columns": [{"name": "Done", "tasks": [{"id": "task-1", "updated_at": 1}]}]}
 
         self.assertEqual(notifier.flatten_tasks(board), [{"id": "task-1", "updated_at": 1, "status": "done"}])
 
-    def test_target_is_parsed_from_description_or_body_json_block(self) -> None:
+    def test_target_is_not_parsed_from_free_text_or_top_level_fields(self) -> None:
         target = {"platform": "zulip", "stream_id": 7, "message_id": 41}
         block = "request\nnotification_target:\n" + json.dumps(target) + "\n\nworkflow:\n{}"
 
-        for field in ("description", "body"):
+        for field in ("description", "body", "details", "content", "notes"):
             with self.subTest(field=field):
-                self.assertEqual(notifier.zulip_target_for_task({field: block}), target)
+                self.assertIsNone(notifier.zulip_target_for_task({field: block}))
+        self.assertIsNone(notifier.zulip_target_for_task({"notification_target": target}))
 
     def test_target_is_parsed_from_source_detail(self) -> None:
         target = {"platform": "zulip", "stream_id": 7, "message_id": 41}
 
         self.assertEqual(notifier.zulip_target_for_task({"source_detail": {"notification_target": target}}), target)
+        self.assertEqual(notifier.zulip_target_for_task({"source_detail": target}), target)
 
     def test_direct_target_is_parsed_with_canonical_recipient(self) -> None:
         task = {
@@ -137,6 +155,7 @@ class CodingWorkflowCreatorTests(unittest.TestCase):
         self.assertEqual(target["message_id"], "41")
         self.assertEqual(payload["source_detail"]["notification_target"], target)
         self.assertIn("adversarial review", payload["body"])
+        self.assertNotIn("notification_target", payload["body"])
 
     def test_payload_can_target_direct_message(self) -> None:
         target = creator.build_payload(self.args(dm_to="user@example.com"))["metadata"]["notification_target"]

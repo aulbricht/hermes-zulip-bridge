@@ -63,6 +63,19 @@ class NotifierHardeningTests(unittest.TestCase):
     def setUp(self) -> None:
         self.key = b"k" * notifier.SIGNING_KEY_BYTES
         self.state = empty_state()
+        policy = mock.patch.dict(
+            os.environ,
+            {
+                "HERMES_ZULIP_STREAM_IDS": "7",
+                "HERMES_ZULIP_TOPIC_POLICY": "any",
+                "HERMES_ZULIP_TOPICS": "",
+                "HERMES_ZULIP_ALLOWED_SENDERS": "id:9,email:human@example.invalid",
+                "HERMES_ZULIP_ALLOW_DMS": "true",
+                "HERMES_ZULIP_ALLOWED_DM_RECIPIENTS": "id:9,email:human@example.invalid",
+            },
+        )
+        policy.start()
+        self.addCleanup(policy.stop)
 
     def reserve_notified(self, count: int) -> None:
         for index in range(count):
@@ -193,14 +206,126 @@ class NotifierHardeningTests(unittest.TestCase):
             sent["content"] = content
             return {"id": 99}
 
-        with mock.patch.object(notifier, "fetch_kanban_board", return_value={"tasks": [task()]}), mock.patch.object(
-            notifier, "fetch_zulip_message", side_effect=fetch
-        ), mock.patch.object(notifier, "post_zulip_message", side_effect=post):
+        with mock.patch.dict(
+            os.environ,
+            {"HERMES_ZULIP_TOPIC_POLICY": "allowlist", "HERMES_ZULIP_TOPICS": "Renamed"},
+        ), mock.patch.object(
+            notifier, "fetch_kanban_board", return_value={"tasks": [task()]}
+        ), mock.patch.object(notifier, "fetch_zulip_message", side_effect=fetch), mock.patch.object(
+            notifier, "post_zulip_message", side_effect=post
+        ):
             counts = notifier.scan_once(self.state, RC, send=True, key=self.key, persist=lambda: None, now=10)
 
         self.assertEqual(posts, [{"stream_id": 7, "topic": "Renamed"}])
         self.assertEqual(counts["delivered"], 1)
         self.assertEqual(self.state["outbox"], [])
+
+    def test_stream_sender_and_topic_policy_denials_never_post(self) -> None:
+        cases = (
+            ({"HERMES_ZULIP_STREAM_IDS": "8"}, origin(), False),
+            ({"HERMES_ZULIP_ALLOWED_SENDERS": "id:10,email:other@example.invalid"}, origin(), True),
+            (
+                {"HERMES_ZULIP_TOPIC_POLICY": "allowlist", "HERMES_ZULIP_TOPICS": "Allowed"},
+                origin(topic="Denied"),
+                True,
+            ),
+        )
+        for environment, fetched_origin, admitted in cases:
+            with self.subTest(environment=environment):
+                state = empty_state()
+                post = mock.Mock()
+                with mock.patch.dict(os.environ, environment), mock.patch.object(
+                    notifier, "fetch_kanban_board", return_value={"tasks": [task()]}
+                ), mock.patch.object(notifier, "fetch_zulip_message", return_value=fetched_origin), mock.patch.object(
+                    notifier, "post_zulip_message", post
+                ):
+                    notifier.scan_once(state, RC, send=True, key=self.key, persist=lambda: None, now=10)
+                post.assert_not_called()
+                self.assertEqual(bool(state["outbox"]), admitted)
+
+    def test_empty_or_malformed_stream_sender_and_topic_policies_fail_closed(self) -> None:
+        cases = (
+            {"HERMES_ZULIP_STREAM_IDS": ""},
+            {"HERMES_ZULIP_STREAM_IDS": "7,not-an-id"},
+            {"HERMES_ZULIP_ALLOWED_SENDERS": ""},
+            {"HERMES_ZULIP_ALLOWED_SENDERS": "human@example.invalid"},
+            {"HERMES_ZULIP_TOPIC_POLICY": ""},
+            {"HERMES_ZULIP_TOPIC_POLICY": "sometimes"},
+            {"HERMES_ZULIP_TOPIC_POLICY": "allowlist", "HERMES_ZULIP_TOPICS": ""},
+        )
+        for environment in cases:
+            with self.subTest(environment=environment):
+                state = empty_state()
+                post = mock.Mock()
+                with mock.patch.dict(os.environ, environment), mock.patch.object(
+                    notifier, "fetch_kanban_board", return_value={"tasks": [task()]}
+                ), mock.patch.object(notifier, "fetch_zulip_message", return_value=origin()), mock.patch.object(
+                    notifier, "post_zulip_message", post
+                ):
+                    notifier.scan_once(state, RC, send=True, key=self.key, persist=lambda: None, now=10)
+                post.assert_not_called()
+
+    def test_direct_messages_default_deny_and_require_exact_allowlist_entry(self) -> None:
+        direct = {
+            "metadata": {
+                "notification_target": {
+                    "platform": "zulip",
+                    "type": "direct",
+                    "to": "human@example.invalid",
+                }
+            }
+        }
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(notifier.zulip_target_for_task(direct))
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HERMES_ZULIP_ALLOW_DMS": "true",
+                "HERMES_ZULIP_ALLOWED_DM_RECIPIENTS": "email:other@example.invalid",
+            },
+        ):
+            self.assertIsNone(notifier.zulip_target_for_task(direct))
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HERMES_ZULIP_ALLOW_DMS": "true",
+                "HERMES_ZULIP_ALLOWED_DM_RECIPIENTS": "email:human@example.invalid",
+            },
+        ):
+            self.assertEqual(notifier.zulip_target_for_task(direct)["to"], "human@example.invalid")
+        direct["metadata"]["notification_target"]["to"] = 9
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HERMES_ZULIP_ALLOW_DMS": "true",
+                "HERMES_ZULIP_ALLOWED_DM_RECIPIENTS": "id:9",
+            },
+        ):
+            self.assertEqual(notifier.zulip_target_for_task(direct)["to"], "9")
+
+    def test_queued_direct_message_rechecks_policy_before_posting(self) -> None:
+        candidate = {
+            "id": "task-dm-policy",
+            "status": "done",
+            "updated_at": 1,
+            "metadata": {
+                "notification_target": {
+                    "platform": "zulip",
+                    "type": "direct",
+                    "to": "human@example.invalid",
+                }
+            },
+        }
+        job = self.add_job(candidate)
+        persist = mock.Mock()
+        post = mock.Mock()
+        with mock.patch.dict(os.environ, {"HERMES_ZULIP_ALLOW_DMS": "false"}), mock.patch.object(
+            notifier, "post_zulip_direct_message", post
+        ):
+            self.assertEqual(notifier._deliver_job(self.state, job, RC, persist, 10), "pending")
+        post.assert_not_called()
+        persist.assert_called_once_with()
+        self.assertEqual(job["stage"], "admitted")
 
     def test_missing_malformed_or_moved_origin_never_posts(self) -> None:
         cases = [

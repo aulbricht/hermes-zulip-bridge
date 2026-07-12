@@ -68,12 +68,6 @@ TERMINAL_STATUSES = {
     for item in env_value("HERMES_ZULIP_NOTIFIER_TERMINAL_STATUSES", "done,complete,completed,blocked", "ZULIP_KANBAN_NOTIFIER_TERMINAL_STATUSES").split(",")
     if item.strip()
 }
-JSON_BLOCK_RE = re.compile(
-    r"(?P<label>zulip_origin|notification_target|notify_target|origin)\s*:\s*(?P<json>\{.*?\})(?=\s*\n\S|\Z)",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
 def log(*parts: object) -> None:
     event = str(parts[0]) if parts and re.fullmatch(r"[a-z][a-z0-9_]*", str(parts[0])) else "event"
     values = [part if type(part) is int else opaque_log_value(part) for part in parts[1:]]
@@ -89,6 +83,63 @@ def strict_positive_int(value: object) -> int | None:
         parsed = int(value)
         return parsed if parsed <= 2**63 - 1 else None
     return None
+
+
+def _policy_values(name: str, *legacy_names: str) -> list[str]:
+    raw = env_value(name, "", *legacy_names)
+    values = [value.strip() for value in raw.split(",")]
+    if not raw.strip() or any(not value for value in values):
+        raise RouteError(f"{name} policy is empty or malformed")
+    return values
+
+
+def _direct_identity(value: object) -> frozenset[str] | None:
+    if isinstance(value, bool):
+        return None
+    if (user_id := strict_positive_int(value)) is not None:
+        return frozenset({f"id:{user_id}"})
+    if isinstance(value, str):
+        email = value.strip().casefold()
+        if email.count("@") == 1 and all(email.split("@")) and not any(character.isspace() for character in email):
+            return frozenset({f"email:{email}"})
+    return None
+
+
+def _identity_policy(name: str, *legacy_names: str) -> set[str]:
+    allowed: set[str] = set()
+    for value in _policy_values(name, *legacy_names):
+        prefix, separator, identity = value.partition(":")
+        parsed = _direct_identity(identity)
+        if not separator or prefix not in {"id", "email"} or parsed is None or not next(iter(parsed)).startswith(prefix + ":"):
+            raise RouteError(f"{name} policy is empty or malformed")
+        allowed.update(parsed)
+    return allowed
+
+
+def _authorize_stream(stream_id: int, topic: str | None = None) -> None:
+    allowed_streams = {strict_positive_int(value) for value in _policy_values("HERMES_ZULIP_STREAM_IDS", "ZULIP_BRIDGE_STREAM_IDS")}
+    if None in allowed_streams or stream_id not in allowed_streams:
+        raise RouteError("Zulip stream destination is denied")
+    topic_policy = os.environ.get("HERMES_ZULIP_TOPIC_POLICY", "").strip().lower()
+    if topic_policy not in {"any", "allowlist"}:
+        raise RouteError("HERMES_ZULIP_TOPIC_POLICY policy is empty or malformed")
+    if topic_policy == "any":
+        return
+    topics = _policy_values("HERMES_ZULIP_TOPICS", "ZULIP_BRIDGE_TOPICS")
+    if topic is None:
+        return
+    if topic not in topics:
+        raise RouteError("Zulip topic destination is denied")
+
+
+def _authorize_direct_recipient(recipient: str) -> None:
+    enabled = os.environ.get("HERMES_ZULIP_ALLOW_DMS", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        raise RouteError("Zulip direct messages are disabled")
+    allowed = _identity_policy("HERMES_ZULIP_ALLOWED_DM_RECIPIENTS", "HERMES_ZULIP_DM_RECIPIENTS")
+    identities = _expected_direct_identities({}, recipient)
+    if identities is None or any(not identity <= allowed for identity in identities):
+        raise RouteError("Zulip direct-message recipient is denied")
 
 
 def load_rc(path: Path = RC_PATH) -> dict[str, str]:
@@ -176,6 +227,10 @@ def _verified_origin(rc: dict[str, str], origin_message_id: int, stream_id: int)
         or sender_email == str(rc.get("email") or "")
     ):
         raise RouteError("origin message scope is invalid")
+    sender = {f"id:{message['sender_id']}", f"email:{sender_email.casefold()}"}
+    if sender.isdisjoint(_identity_policy("HERMES_ZULIP_ALLOWED_SENDERS")):
+        raise RouteError("origin sender is denied")
+    _authorize_stream(stream_id, topic)
     return {**message, "id": origin_message_id, "stream_id": stream_id, "topic": topic}
 
 
@@ -201,6 +256,7 @@ def current_zulip_target(rc: dict[str, str], target: dict[str, Any]) -> dict[str
         recipient = direct_recipient_for_target(target)
         if not recipient:
             raise RouteError("direct-message recipient is invalid")
+        _authorize_direct_recipient(recipient)
         return {**target, "type": "direct", "to": recipient}
     origin_id = strict_positive_int(target.get("message_id"))
     stream_id = strict_positive_int(target.get("stream_id"))
@@ -234,26 +290,15 @@ def flatten_tasks(board_payload: dict[str, Any]) -> list[dict[str, Any]]:
     return tasks
 
 
-def _candidate_text_fields(task: dict[str, Any]) -> str:
-    return "\n".join(value for key in ("description", "body", "details", "content", "notes") if isinstance((value := task.get(key)), str))
-
-
-def _parse_json_blocks(text: str) -> list[dict[str, Any]]:
-    parsed: list[dict[str, Any]] = []
-    for match in JSON_BLOCK_RE.finditer(text or ""):
-        try:
-            value = json.loads(match.group("json"))
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            parsed.append(value)
-    return parsed
-
-
 def zulip_target_for_task(task: dict[str, Any]) -> dict[str, Any] | None:
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     source = task.get("source_detail") if isinstance(task.get("source_detail"), dict) else {}
-    candidates = [*(task.get(key) for key in ("notification_target", "notify_target", "origin")), *(metadata.get(key) for key in ("notification_target", "notify_target", "origin")), *(source.get(key) for key in ("notification_target", "notify_target", "origin")), *_parse_json_blocks(_candidate_text_fields(task))]
+    candidates = [
+        metadata,
+        source,
+        *(metadata.get(key) for key in ("notification_target", "notify_target", "origin")),
+        *(source.get(key) for key in ("notification_target", "notify_target", "origin")),
+    ]
     for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
@@ -263,11 +308,20 @@ def zulip_target_for_task(task: dict[str, Any]) -> dict[str, Any] | None:
         if target_delivery_type(target) == "direct":
             recipient = direct_recipient_for_target(target)
             if recipient:
-                return {**target, "type": "direct", "to": recipient}
+                direct = {**target, "type": "direct", "to": recipient}
+                try:
+                    _authorize_direct_recipient(recipient)
+                except RouteError:
+                    continue
+                return direct
             continue
         origin_id = strict_positive_int(target.get("message_id"))
         stream_id = strict_positive_int(target.get("stream_id"))
         if origin_id is not None and stream_id is not None:
+            try:
+                _authorize_stream(stream_id)
+            except RouteError:
+                continue
             return {**target, "message_id": origin_id, "stream_id": stream_id}
     return None
 
@@ -732,18 +786,6 @@ def _dead_letter(state: dict[str, Any], job: dict[str, Any], reason: str, now: f
     state["outbox"] = [item for item in state.get("outbox", []) if item is not job]
 
 
-def _direct_identity(value: object) -> frozenset[str] | None:
-    if isinstance(value, bool):
-        return None
-    if (user_id := strict_positive_int(value)) is not None:
-        return frozenset({f"id:{user_id}"})
-    if isinstance(value, str):
-        email = value.strip().lower()
-        if email and "@" in email and not any(character.isspace() for character in email):
-            return frozenset({f"email:{email}"})
-    return None
-
-
 def _expected_direct_identities(rc: dict[str, str], recipient: str) -> list[frozenset[str]] | None:
     try:
         parsed = json.loads(recipient)
@@ -848,22 +890,24 @@ def _deliver_job(state: dict[str, Any], job: dict[str, Any], rc: dict[str, str],
     if job["stage"] == "operator_review":
         return "operator_review"
     route: tuple[int, str] | None = None
-    if job["type"] == "stream":
-        try:
+    try:
+        if job["type"] == "stream":
             target = current_zulip_target(
                 rc,
                 {"message_id": job["origin_message_id"], "stream_id": job["stream_id"]},
             )
-        except Exception:
-            job["attempts"] = min(job["attempts"] + 1, MAX_ATTEMPTS)
-            if job["attempts"] >= MAX_ATTEMPTS:
-                _dead_letter(state, job, "operator_review_origin_unavailable", now)
-                persist()
-                return "operator_review"
-            job["next_attempt_at"] = now + _retry_delay(job["attempts"])
+            route = (job["stream_id"], target["topic"])
+        else:
+            current_zulip_target(rc, {"type": "direct", "to": job["recipient"]})
+    except Exception:
+        job["attempts"] = min(job["attempts"] + 1, MAX_ATTEMPTS)
+        if job["attempts"] >= MAX_ATTEMPTS:
+            _dead_letter(state, job, "operator_review_origin_unavailable", now)
             persist()
-            return "pending"
-        route = (job["stream_id"], target["topic"])
+            return "operator_review"
+        job["next_attempt_at"] = now + _retry_delay(job["attempts"])
+        persist()
+        return "pending"
     if job["stage"] != "admitted":
         try:
             delivered = _reconcile(rc, job, route)

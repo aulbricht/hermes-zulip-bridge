@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Create a Kanban coding task with the Hermes adversarial-review contract.
 
-The task body carries machine-readable Zulip notification metadata so
+The task payload carries machine-readable Zulip notification metadata so
 the Zulip Kanban notifier can post a durable callback when the workflow reaches a
 terminal state.
 """
@@ -70,23 +70,6 @@ def request_json(
 
 
 def build_task_body(args: argparse.Namespace) -> str:
-    origin = {
-        "platform": "zulip",
-        "stream": args.stream,
-        "stream_id": getattr(args, "stream_id", None),
-        "topic": args.topic,
-        "message_id": args.message_id,
-        "bridge_marker": args.bridge_marker,
-    }
-    if args.dm_to:
-        origin = {
-            "platform": "zulip",
-            "type": "direct",
-            "to": args.dm_to,
-            "message_id": args.message_id,
-            "bridge_marker": args.bridge_marker,
-        }
-    notification_target = {key: value for key, value in origin.items() if value}
     sections = [
         "Coding workflow contract:",
         "1. Coder implements the requested change in the indicated repository/workspace.",
@@ -114,9 +97,6 @@ def build_task_body(args: argparse.Namespace) -> str:
     sections.extend(f"- {item}" for item in criteria)
     sections.extend(
         [
-            "",
-            "notification_target:",
-            json.dumps(notification_target, sort_keys=True),
             "",
             "workflow:",
             json.dumps(
