@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import http.server
 import json
 import os
 import stat
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -90,6 +92,50 @@ class NotifierHardeningTests(unittest.TestCase):
         self.state["revisions"][job["task_id"]] = {"revision": job["revision"], "signature": job["signature"]}
         self.state["outbox"].append(job)
         return job
+
+    def test_authenticated_notifier_request_refuses_cross_origin_redirect(self) -> None:
+        captured: list[str | None] = []
+
+        class Sink(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                captured.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{}')
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        sink = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Sink)
+        sink_thread = threading.Thread(target=sink.serve_forever, daemon=True)
+        sink_thread.start()
+        self.addCleanup(sink.server_close)
+        self.addCleanup(sink.shutdown)
+
+        location = f"http://127.0.0.1:{sink.server_port}/capture"
+
+        class Source(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(302)
+                self.send_header("Location", location)
+                self.end_headers()
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        source = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Source)
+        source_thread = threading.Thread(target=source.serve_forever, daemon=True)
+        source_thread.start()
+        self.addCleanup(source.server_close)
+        self.addCleanup(source.shutdown)
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 302"):
+            notifier.request_json(
+                "GET",
+                f"http://127.0.0.1:{source.server_port}/start",
+                headers={"Authorization": "Basic credential-canary"},
+            )
+        self.assertEqual(captured, [])
 
     def write_state(self, root: str, state: dict | None = None) -> Path:
         path = Path(root) / "state.json"

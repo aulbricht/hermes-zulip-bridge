@@ -79,13 +79,14 @@ class ZulipAttachmentTests(unittest.TestCase):
         routes = mock.patch.multiple(
             bridge,
             ALLOW_STREAMS=set(),
-            ALLOW_STREAM_IDS=set(),
+            ALLOW_STREAM_IDS={str(value) for value in range(1, 1001)},
             ALLOW_TOPICS=set(),
             TOPIC_POLICY="any",
             ALLOWED_SENDERS={"id:17"},
             PRIVILEGED_SENDERS=set(),
             PRIVILEGED_SLASH_COMMANDS=set(),
             REQUIRE_MENTION=False,
+            HERMES_EXTRA_ARGS=["--toolsets", "coding"],
         )
         routes.start()
         self.addCleanup(routes.stop)
@@ -773,6 +774,7 @@ class ZulipAttachmentTests(unittest.TestCase):
             "stream_id": 1,
             "display_recipient": "hermes",
             "topic": "Topic",
+            "sender_id": 17,
             "sender_email": "user@example.com",
             "content": "hello",
         }
@@ -1164,8 +1166,8 @@ with bridge.process_lock(Path(sys.argv[1])):
                         "stream_id": 1,
                         "display_recipient": "hermes",
                         "topic": "Allowed",
-                        "sender_email": "user@example.com",
                         "sender_id": 17,
+                        "sender_email": "user@example.com",
                         "sender_is_bot": False,
                         "content": "hello",
                     },
@@ -1179,8 +1181,8 @@ with bridge.process_lock(Path(sys.argv[1])):
                         "stream_id": 1,
                         "display_recipient": "hermes",
                         "topic": "Blocked",
-                        "sender_email": "user@example.com",
                         "sender_id": 17,
+                        "sender_email": "user@example.com",
                         "sender_is_bot": False,
                         "content": "hello",
                     },
@@ -1204,8 +1206,8 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "hermes",
             "topic": "✔ Allowed",
-            "sender_email": "user@example.com",
             "sender_id": 17,
+            "sender_email": "user@example.com",
             "sender_is_bot": False,
             "content": "hello",
         }
@@ -1223,8 +1225,8 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "hermes",
             "topic": "Allowed",
-            "sender_email": "user@example.com",
             "sender_id": 17,
+            "sender_email": "user@example.com",
             "sender_is_bot": False,
             "content": "hello",
         }
@@ -1249,8 +1251,8 @@ with bridge.process_lock(Path(sys.argv[1])):
                         "stream_id": 123,
                         "display_recipient": "new-name",
                         "topic": "Allowed",
-                        "sender_email": "user@example.com",
                         "sender_id": 17,
+                        "sender_email": "user@example.com",
                         "sender_is_bot": False,
                         "content": "hello",
                     },
@@ -1264,8 +1266,8 @@ with bridge.process_lock(Path(sys.argv[1])):
                         "stream_id": 456,
                         "display_recipient": "old-name",
                         "topic": "Allowed",
-                        "sender_email": "user@example.com",
                         "sender_id": 17,
+                        "sender_email": "user@example.com",
                         "sender_is_bot": False,
                         "content": "hello",
                     },
@@ -2482,6 +2484,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "stream-1",
             "topic": "Renamed",
+            "sender_id": 17,
             "sender_email": "user@example.com",
             "content": "hello",
         }
@@ -3147,8 +3150,8 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "hermes",
             "topic": "Allowed",
-            "sender_email": "user@example.com",
             "sender_id": 17,
+            "sender_email": "user@example.com",
             "sender_is_bot": False,
             "content": "archive-import: archived note",
         }
@@ -3887,7 +3890,7 @@ with bridge.process_lock(Path(sys.argv[1])):
         hermes_script = self.python_console_script("raise SystemExit(0)")
         try:
             bridge.HERMES = hermes_script
-            bridge.HERMES_EXTRA_ARGS = ["--profile", "hermes"]
+            bridge.HERMES_EXTRA_ARGS = ["--profile", "hermes", "--toolsets", "coding"]
             bridge.subprocess.Popen = fake_popen
             bridge.topic_history = lambda _rc, _message: ""
             bridge.build_attachment_context = lambda _rc, _content, _directory=None: ""
@@ -3914,11 +3917,38 @@ with bridge.process_lock(Path(sys.argv[1])):
         command = captured["cmd"]
         resolved_script = str(hermes_script.resolve())
         script_index = command.index(resolved_script)
-        self.assertEqual(command[script_index:], [resolved_script, "--profile", "hermes", "-z"])
+        self.assertEqual(
+            command[script_index:],
+            [resolved_script, "--profile", "hermes", "--toolsets", "coding", "-z"],
+        )
         self.assertEqual(command[1:3], ["-c", bridge._PROCESS_START_GATE])
         for argument in command:
             for private in (content_canary, topic_canary, sender_canary, "active_message_id 999"):
                 self.assertNotIn(private, argument)
+
+    def test_direct_runtime_rejects_abbreviated_or_unrestricted_hermes_arguments(self) -> None:
+        values = {
+            "message": {"id": 1},
+            "session_id": None,
+            "active_message_id": 1,
+            "user_text": "hello",
+            "attachment_context": "",
+            "history": "",
+            "stream": "stream",
+            "topic": "topic",
+            "sender": "user",
+        }
+        for args in (
+            [],
+            ["--toolsets", "all"],
+            ["--toolsets", "hermes-cli"],
+            ["--toolsets", "coding", "--tools=all"],
+            ["--toolsets", "coding", "--yo"],
+        ):
+            with self.subTest(args=args), mock.patch.object(bridge, "HERMES_EXTRA_ARGS", args), self.assertRaises(
+                ValueError
+            ):
+                bridge._hermes_command(**values)
 
     def test_terminal_safe_log_fields_escape_controls_and_bound_length(self) -> None:
         hostile = (
@@ -4339,7 +4369,11 @@ with bridge.process_lock(Path(sys.argv[1])):
             "content": "go",
         }
         with (
-            mock.patch.object(bridge, "_hermes_command", return_value=("marker", [str(hermes_script), "-z", "private"])),
+            mock.patch.object(
+                bridge,
+                "_hermes_command",
+                return_value=("marker", [str(hermes_script), "--toolsets", "coding", "-z", "private"]),
+            ),
             mock.patch.object(bridge, "HERMES_OUTPUT_MAX_BYTES", size + 1024),
             mock.patch.object(bridge, "refresh_generation_origin"),
             mock.patch.object(bridge, "build_attachment_context", return_value=""),
@@ -4450,7 +4484,7 @@ with bridge.process_lock(Path(sys.argv[1])):
         with (
             mock.patch.object(bridge, "HERMES_OUTPUT_MAX_BYTES", limit),
             mock.patch.object(bridge, "SHUTTING_DOWN", False),
-            mock.patch.object(bridge, "_hermes_command", return_value=("marker", [str(hermes_script), "-z", "private"])),
+            mock.patch.object(bridge, "_hermes_command", return_value=("marker", [str(hermes_script), "--toolsets", "coding", "-z", "private"])),
             mock.patch.object(bridge, "refresh_generation_origin"),
             mock.patch.object(bridge, "build_attachment_context", return_value=""),
             mock.patch.object(bridge, "topic_history", return_value=""),
@@ -4855,7 +4889,7 @@ with bridge.process_lock(Path(sys.argv[1])):
         )
         hermes_script = self.python_console_script(parent_code)
         with (
-            mock.patch.object(bridge, "_hermes_command", return_value=("marker", [str(hermes_script), "-z", "private"])),
+            mock.patch.object(bridge, "_hermes_command", return_value=("marker", [str(hermes_script), "--toolsets", "coding", "-z", "private"])),
             mock.patch.object(bridge, "refresh_generation_origin"),
             mock.patch.object(bridge, "build_attachment_context", return_value=""),
             mock.patch.object(bridge, "topic_history", return_value=""),
@@ -5294,6 +5328,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "stream-1",
             "topic": "Renamed",
+            "sender_id": 17,
             "sender_email": "user@example.com",
             "content": "hello",
         }
@@ -5737,6 +5772,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "stream-1",
             "topic": "Topic",
+            "sender_id": 17,
             "sender_email": "user@example.com",
             "content": "hello",
         }
@@ -5823,6 +5859,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "stream-1",
             "topic": "Before",
+            "sender_id": 17,
             "sender_email": "user@example.com",
             "content": "hello",
         }
@@ -6064,6 +6101,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "stream-1",
             "topic": "Topic",
+            "sender_id": 17,
             "sender_email": "user@example.com",
             "content": "hello",
         }])
@@ -6121,6 +6159,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "stream-1",
             "topic": "Topic",
+            "sender_id": 17,
             "sender_email": "user@example.com",
             "content": "hello",
         }
@@ -7213,6 +7252,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                 "stream_id": 1,
                 "display_recipient": "stream-1",
                 "topic": topic,
+                "sender_id": 17,
                 "sender_email": "user@example.com",
                 "content": "hello",
             }
@@ -7245,6 +7285,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "stream-1",
             "topic": "Topic",
+            "sender_id": 17,
             "sender_email": "user@example.com",
             "content": "hello",
         }
@@ -7320,6 +7361,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                 mock.patch.object(bridge, "latest_messages", return_value=[parent, steering]),
                 mock.patch.object(bridge, "STEERING_PATH", steering_path),
                 mock.patch.object(bridge, "STEERING_STATE_ASSOCIATED", False),
+                mock.patch.object(bridge, "retire_stale_steering_paths"),
                 mock.patch.object(
                     bridge, "validated_active_steering_message", side_effect=lambda _rc, current: current
                 ),
@@ -7356,6 +7398,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "stream-1",
             "topic": "Topic",
+            "sender_id": 17,
             "sender_email": "user@example.com",
             "content": "hello",
         }
@@ -7432,6 +7475,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "stream-1",
             "topic": "Topic",
+            "sender_id": 17,
             "sender_email": "user@example.com",
             "content": "hello",
         }
@@ -7481,6 +7525,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "stream-1",
             "topic": "Topic",
+            "sender_id": 17,
             "sender_email": "user@example.com",
             "content": "hello",
         }
@@ -7940,6 +7985,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "stream-1",
             "topic": "Topic",
+            "sender_id": 17,
             "sender_email": "user@example.com",
             "content": "hello",
         }
@@ -7970,6 +8016,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             "stream_id": 1,
             "display_recipient": "stream-1",
             "topic": "Topic",
+            "sender_id": 17,
             "sender_email": "user@example.com",
             "content": "hello",
         }
@@ -8688,7 +8735,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             mock.patch.object(bridge, "api", side_effect=fake_api),
             mock.patch.object(bridge, "fetch_zulip_attachment", return_value=attachment) as fetch,
             mock.patch.object(bridge, "HERMES", script),
-            mock.patch.object(bridge, "HERMES_EXTRA_ARGS", []),
+            mock.patch.object(bridge, "HERMES_EXTRA_ARGS", ["--toolsets", "coding"]),
             mock.patch.object(bridge, "typing_status"),
             mock.patch.object(bridge, "find_session_by_marker", return_value="child-session"),
             mock.patch.object(bridge, "clean_session_record"),
@@ -9829,7 +9876,7 @@ with bridge.process_lock(Path(sys.argv[1])):
         with mock.patch.object(bridge, "api", api):
             history = bridge.topic_history({}, origin)
 
-        self.assertEqual(history, "- user: prior text")
+        self.assertEqual(history, "- user@example.com: prior text")
         params = api.call_args.kwargs["params"]
         self.assertEqual(
             json.loads(params["narrow"]),
@@ -9842,6 +9889,7 @@ with bridge.process_lock(Path(sys.argv[1])):
         messages = [
             {**base, "id": 7, "sender_id": 18, "sender_email": "other@example.com", "sender_is_bot": False, "content": "inject"},
             {**base, "id": 8, "sender_id": 50, "sender_email": "other-bot@example.com", "sender_is_bot": True, "content": "bot inject"},
+            {**base, "id": 6, "sender_id": 99, "sender_email": "bot@example.com", "content": "laundered inject"},
             {**base, "id": 9, "sender_id": 17, "sender_email": "user@example.com", "sender_is_bot": False, "content": "authorized"},
         ]
         with mock.patch.object(bridge, "api", return_value=zulip_success(messages=messages)):
@@ -9868,8 +9916,14 @@ with bridge.process_lock(Path(sys.argv[1])):
                 self.assertFalse(path.exists())
                 bridge.STEERING_PATH.write_text("legacy plaintext", encoding="utf-8")
                 bridge.STEERING_PATH.chmod(0o644)
-                bridge.retire_legacy_steering_path()
+                for active_id in (112, 113):
+                    stale = bridge.active_steering_path(active_id)
+                    stale.write_text("stale private steering", encoding="utf-8")
+                    stale.chmod(0o600)
+                bridge.retire_stale_steering_paths()
                 self.assertFalse(bridge.STEERING_PATH.exists())
+                self.assertFalse(bridge.active_steering_path(112).exists())
+                self.assertFalse(bridge.active_steering_path(113).exists())
 
     def test_soft_steering_append_is_the_exactly_once_delivery_contract(self) -> None:
         active: dict = {}
@@ -9893,7 +9947,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             ):
                 first = bridge.handle_active_topic_message({}, message, "s1", conversation, 111, active, seen)
                 second = bridge.handle_active_topic_message({}, message, "s1", conversation, 111, active, seen)
-                lines = bridge.STEERING_PATH.read_text(encoding="utf-8").splitlines()
+                lines = bridge.active_steering_path(111).read_text(encoding="utf-8").splitlines()
         self.assertEqual((first, second), ("delivered", "delivered"))
         self.assertEqual(len(lines), 1)
         self.assertEqual(seen, set())
@@ -11303,13 +11357,37 @@ with bridge.process_lock(Path(sys.argv[1])):
             "sender_full_name": "Private Sender",
             "content": "private message body",
         }
+
+        class FakeProc:
+            pid = 999001
+            returncode = 0
+
+            def __init__(self, payload: str) -> None:
+                self.payload = payload
+
+            def poll(self) -> int:
+                return 0
+
+            def wait(self, **_kwargs: object) -> int:
+                return 0
+
+            def communicate(self, **_kwargs: object) -> tuple[str, str]:
+                return self.payload, ""
+
+        def start(_message_id: int, command: list[str], *_args: object, **_kwargs: object) -> tuple[FakeProc, bool]:
+            prompt = command[command.index("-z") + 1]
+            return FakeProc(json.dumps({"prompt": prompt, "argv": command[1:]})), False
+
         with (
             mock.patch.object(bridge, "HERMES", script),
-            mock.patch.object(bridge, "HERMES_EXTRA_ARGS", ["--profile", "fixture"]),
+            mock.patch.object(
+                bridge, "HERMES_EXTRA_ARGS", ["--profile", "fixture", "--toolsets", "coding"]
+            ),
             mock.patch.object(bridge, "RC_PATH", Path("/private/credentials/zuliprc")),
             mock.patch.object(bridge, "refresh_generation_origin"),
             mock.patch.object(bridge, "build_attachment_context", return_value="\nprivate attachment text"),
             mock.patch.object(bridge, "topic_history", return_value="private topic history"),
+            mock.patch.object(bridge, "_start_registered_process", side_effect=start),
             mock.patch.object(bridge, "typing_status"),
             mock.patch.object(bridge, "find_session_by_marker", return_value="child-session"),
             mock.patch.object(bridge, "clean_session_record") as clean,

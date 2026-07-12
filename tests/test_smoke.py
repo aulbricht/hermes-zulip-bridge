@@ -49,6 +49,7 @@ class SmokeTests(unittest.TestCase):
             ALLOWED_SENDERS={"id:17"},
             TOPIC_POLICY="any",
             REQUIRE_MENTION=False,
+            HERMES_EXTRA_ARGS=["--toolsets", "coding"],
         )
         policy.start()
         self.addCleanup(policy.stop)
@@ -1273,7 +1274,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                 load_alias_entries=lambda: [],
                 api=fake_api,
                 HERMES=hermes,
-                HERMES_EXTRA_ARGS=[],
+                HERMES_EXTRA_ARGS=["--toolsets", "coding"],
                 STEERING_PATH=Path(tmpdir) / "steering.jsonl",
                 ALLOW_STREAMS={"hermes"},
                 ALLOW_STREAM_IDS={"7"},

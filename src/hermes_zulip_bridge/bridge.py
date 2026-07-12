@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .security import opaque_log_value, secure_read_text
+from .config import validate_hermes_invocation_args
 
 from .cli import (
     LauncherProof,
@@ -1872,6 +1873,21 @@ def retire_legacy_steering_path() -> None:
         _fsync_directory(STEERING_PATH.parent)
     except FileNotFoundError:
         return
+
+
+def retire_stale_steering_paths() -> None:
+    retire_legacy_steering_path()
+    try:
+        candidates = list(STEERING_PATH.parent.iterdir())
+    except FileNotFoundError:
+        return
+    prefix = STEERING_PATH.name + "."
+    for candidate in candidates:
+        if not candidate.name.startswith(prefix):
+            continue
+        active_id = strict_positive_int(candidate.name.removeprefix(prefix))
+        if active_id is not None:
+            remove_active_steering_path(active_id)
 
 
 def store_steering_message(rc: dict[str, str], message: dict, conversation: dict, active_message_id: int) -> dict:
@@ -4439,10 +4455,7 @@ def _validated_generation_origin(rc: dict[str, str], message: dict) -> dict:
         )
     sender_is_bot = origin.get("sender_is_bot")
     if sender_is_bot is True or (sender_is_bot is not None and type(sender_is_bot) is not bool):
-        raise ReplyRoutingError(
-            f"origin message {message.get('id')} has no complete sender authorization",
-            retryable=True,
-        )
+        raise ReplyRoutingError(f"origin message {message.get('id')} has no complete sender authorization")
     sender_id, sender_email = _origin_sender_identity(origin, retryable_missing=True)
     if sender_id is None:
         raise ReplyRoutingError(
@@ -4556,7 +4569,7 @@ def topic_history(rc: dict[str, str], message: dict) -> str:
             raise ReplyRoutingError(f"ambiguous Zulip topic-history response for {stream_id}/{topic}")
         seen_ids.add(member_id)
         own_bot_message = sender_email.strip().casefold() == str(rc.get("email") or "").strip().casefold()
-        if member_id < current_id and (own_bot_message or sender_is_allowed(member)):
+        if member_id < current_id and not own_bot_message and sender_is_allowed(member):
             messages.append(member)
     if len(messages) > 30:
         messages = messages[:8] + [{"sender_full_name": "...", "content": "..."}] + messages[-20:]
@@ -5843,7 +5856,8 @@ def _hermes_command(
         f"{history or '(No prior visible topic history.)'}\n"
         "----- END UNTRUSTED ZULIP TOPIC HISTORY -----"
     )
-    cmd = [str(HERMES), *HERMES_EXTRA_ARGS, "-z", prompt]
+    hermes_args = validate_hermes_invocation_args(HERMES_EXTRA_ARGS)
+    cmd = [str(HERMES), *hermes_args, "-z", prompt]
     if session_id:
         cmd.extend(["--resume", session_id])
     return marker, cmd
@@ -5887,7 +5901,7 @@ def hermes_reply(rc: dict[str, str], message: dict, session_id: str | None) -> t
             active_message_id,
             cmd,
             execution if isinstance(execution, dict) else None,
-            private_arg_index=len(HERMES_EXTRA_ARGS) + 2,
+            private_arg_index=len(validate_hermes_invocation_args(HERMES_EXTRA_ARGS)) + 2,
             python_launcher=launcher_proof,
             text=True,
             stdout=subprocess.PIPE,
@@ -6490,7 +6504,7 @@ def _main(
 
     state_path = STATE_PATH if state_path is None else state_path
     freeze_auxiliary_paths(state_path)
-    retire_legacy_steering_path()
+    retire_stale_steering_paths()
     state_path = STATE_PATH
     loaded_state = load_json(state_path, {"seen_ids": [], "topic_sessions": {}})
     validated_state = require_state_object(copy.deepcopy(loaded_state))

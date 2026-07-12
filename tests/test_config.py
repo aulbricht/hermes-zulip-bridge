@@ -230,19 +230,36 @@ response:
             validate_config({**base, "hermes": {"command": "/bin/true"}}),
         )
         self.assertIn(
-            "hermes.toolsets may not include all",
+            "hermes.toolsets contains an unsupported chat toolset",
             validate_config({**base, "hermes": secure_hermes(toolsets=["all"])}),
+        )
+        self.assertIn(
+            "hermes.toolsets contains an unsupported chat toolset",
+            validate_config({**base, "hermes": secure_hermes(toolsets=["hermes-cli"])}),
         )
         self.assertIn(
             "hermes.toolsets entries must contain only letters, numbers, underscores, or hyphens",
             validate_config({**base, "hermes": secure_hermes(toolsets=["coding,all"])}),
         )
-        for extra_args in (["--yolo"], ["-t", "all"], ["--toolsets=all"]):
+        for extra_args in (["--yolo"], ["--yo"], ["-t", "all"], ["--toolsets=all"], ["--tools=all"]):
             with self.subTest(extra_args=extra_args):
                 self.assertIn(
-                    "hermes.extra_args may not override toolsets or enable --yolo",
+                    "hermes.extra_args is not allowed; use the explicit profile and toolsets fields",
                     validate_config({**base, "hermes": secure_hermes(extra_args=extra_args)}),
                 )
+
+    def test_notifier_direct_message_switch_requires_an_actual_boolean(self) -> None:
+        base = {
+            "hermes": secure_hermes(),
+            "zulip": secure_zulip(zuliprc="/tmp/test.zuliprc"),
+        }
+        for value in ("false", "true", 0, 1, None):
+            with self.subTest(value=value):
+                config = {**base, "notifier": {"allow_direct_messages": value}}
+                self.assertIn("notifier.allow_direct_messages must be a boolean", validate_config(config))
+        disabled = {**base, "notifier": {"allow_direct_messages": False}}
+        self.assertEqual(validate_config(disabled), [])
+        self.assertEqual(bridge_config.apply_notifier_env(disabled)["HERMES_ZULIP_ALLOW_DMS"], "0")
 
     def test_notifier_exports_the_same_destination_and_sender_policy(self) -> None:
         config = {

@@ -13,6 +13,49 @@ from .security import secure_read_text
 
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_ZULIPRC_BYTES = 1024 * 1024
+CHAT_TOOLSETS = frozenset(
+    {
+        "browser",
+        "clarify",
+        "code_execution",
+        "coding",
+        "context_engine",
+        "cronjob",
+        "debugging",
+        "delegation",
+        "file",
+        "image_gen",
+        "kanban",
+        "memory",
+        "project",
+        "safe",
+        "search",
+        "session_search",
+        "skills",
+        "terminal",
+        "todo",
+        "tts",
+        "video",
+        "video_gen",
+        "vision",
+        "web",
+    }
+)
+
+
+def validate_hermes_invocation_args(args: list[str]) -> list[str]:
+    values = list(args)
+    index = 0
+    if values[:1] == ["--profile"]:
+        if len(values) < 2 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", values[1]):
+            raise ValueError("Hermes profile argument is invalid")
+        index = 2
+    if values[index:index + 1] != ["--toolsets"] or len(values) != index + 2:
+        raise ValueError("Hermes invocation arguments do not match the restricted bridge policy")
+    toolsets = values[index + 1].split(",")
+    if not toolsets or any(value not in CHAT_TOOLSETS for value in toolsets):
+        raise ValueError("Hermes invocation contains an unsupported chat toolset")
+    return values
 
 
 def preflight_credentials(config: dict[str, Any], *, require_secret: bool = True) -> dict[str, str]:
@@ -88,17 +131,14 @@ def validate_config(config: dict[str, Any], *, require_secret: bool = False) -> 
         issues.append("hermes.toolsets must contain at least one restricted Hermes toolset")
     if any(not re.fullmatch(r"[A-Za-z0-9_-]+", str(value)) for value in toolsets):
         issues.append("hermes.toolsets entries must contain only letters, numbers, underscores, or hyphens")
-    if any(str(value).casefold() == "all" for value in toolsets):
-        issues.append("hermes.toolsets may not include all")
+    if any(str(value) not in CHAT_TOOLSETS for value in toolsets):
+        issues.append("hermes.toolsets contains an unsupported chat toolset")
+    profile = hermes.get("profile")
+    if profile is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(profile)):
+        issues.append("hermes.profile is malformed")
     extra_args = _list(hermes.get("extra_args"))
-    if any(
-        str(value).startswith("-t")
-        or str(value) == "--toolsets"
-        or str(value).startswith("--toolsets=")
-        or str(value).startswith("--yolo")
-        for value in extra_args
-    ):
-        issues.append("hermes.extra_args may not override toolsets or enable --yolo")
+    if extra_args:
+        issues.append("hermes.extra_args is not allowed; use the explicit profile and toolsets fields")
     bridge = _section(config, "bridge")
     poll_failure_limit = bridge.get("poll_failure_limit", bridge.get("max_poll_failures"))
     if poll_failure_limit is not None and (
@@ -133,8 +173,11 @@ def validate_config(config: dict[str, Any], *, require_secret: bool = False) -> 
     if privileged_senders and not set(privileged_senders).issubset(set(allowed_senders)):
         issues.append("bridge.privileged_senders must be included in zulip.allowed_senders")
     notifier = _section(config, "notifier") or _section(config, "kanban")
+    allow_direct_messages = notifier.get("allow_direct_messages", False)
+    if type(allow_direct_messages) is not bool:
+        issues.append("notifier.allow_direct_messages must be a boolean")
     dm_recipients = _list(notifier.get("allowed_dm_recipients"))
-    if notifier.get("allow_direct_messages", False) and not dm_recipients:
+    if allow_direct_messages is True and not dm_recipients:
         issues.append("notifier.allowed_dm_recipients is required when direct messages are enabled")
     if any(not _valid_sender(value) for value in dm_recipients):
         issues.append("notifier.allowed_dm_recipients entries must use id:<user-id> or email:<address>")
@@ -171,7 +214,7 @@ def apply_bridge_env(
     env["HERMES_CWD"] = str(_path(hermes.get("working_directory") or hermes.get("cwd") or Path.home()))
     env["HERMES_STATE_DB"] = str(_path(hermes.get("state_db") or Path.home() / ".hermes/state.db"))
     env["HERMES_TIMEOUT_SECONDS"] = str(hermes.get("timeout_seconds") or hermes.get("timeout") or 1800)
-    extra_args = ["--toolsets", ",".join(_list(hermes.get("toolsets"))), *_list(hermes.get("extra_args"))]
+    extra_args = ["--toolsets", ",".join(_list(hermes.get("toolsets")))]
     if hermes.get("profile"):
         extra_args = ["--profile", str(hermes["profile"]), *extra_args]
     env["HERMES_EXTRA_ARGS"] = shlex.join(extra_args)
@@ -274,7 +317,7 @@ def apply_notifier_env(config: dict[str, Any], *, require_secret: bool = True, c
         zulip.get("topic_allowlist") or zulip.get("topics") or zulip.get("topic")
     ) or ""
     env["HERMES_ZULIP_ALLOWED_SENDERS"] = _csv(zulip.get("allowed_senders")) or ""
-    env["HERMES_ZULIP_ALLOW_DMS"] = "1" if notifier.get("allow_direct_messages", False) else "0"
+    env["HERMES_ZULIP_ALLOW_DMS"] = "1" if notifier.get("allow_direct_messages") is True else "0"
     env["HERMES_ZULIP_ALLOWED_DM_RECIPIENTS"] = _csv(notifier.get("allowed_dm_recipients")) or ""
     env["HERMES_ZULIP_NOTIFIER_STATE"] = str(_path(notifier.get("state_path") or state_dir / f"{instance}_zulip_kanban_notifier.json"))
     _install_env(env)

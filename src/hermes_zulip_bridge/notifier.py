@@ -49,6 +49,11 @@ class RouteError(RuntimeError):
     pass
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def env_value(name: str, default: str, *legacy_names: str) -> str:
     for candidate in (name, *legacy_names):
         value = os.environ.get(candidate)
@@ -172,7 +177,7 @@ def request_json(method: str, url: str, *, headers: dict[str, str] | None = None
             req_headers["Content-Type"] = "application/x-www-form-urlencoded"
     req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.build_opener(_RejectRedirects).open(req, timeout=timeout) as resp:
             raw = resp.read(MAX_STATE_BYTES + 1)
             if len(raw) > MAX_STATE_BYTES:
                 raise RuntimeError("remote response exceeds limit")
@@ -181,6 +186,7 @@ def request_json(method: str, url: str, *, headers: dict[str, str] | None = None
                 raise RuntimeError("remote response schema is invalid")
             return payload
     except urllib.error.HTTPError as exc:
+        exc.close()
         raise RuntimeError(f"request failed with HTTP {exc.code}") from exc
     except (urllib.error.URLError, UnicodeError, json.JSONDecodeError) as exc:
         raise RuntimeError("request failed") from exc
