@@ -30,6 +30,10 @@ def secure_zulip(**values: object) -> dict[str, object]:
     }
 
 
+def secure_hermes(**values: object) -> dict[str, object]:
+    return {"command": "/bin/true", "toolsets": ["coding"], **values}
+
+
 class ConfigTests(unittest.TestCase):
     def test_secure_config_file_matrix_and_replacement_detection(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -116,7 +120,7 @@ class ConfigTests(unittest.TestCase):
                 load_config(path)
 
         config = {
-            "hermes": {"command": "/bin/true"},
+            "hermes": secure_hermes(),
             "zulip": {
                 "site": "https://example",
                 "bot_email": "bot@example.com",
@@ -145,6 +149,7 @@ instance_name: hermes
 hermes:
   command: hermes
   profile: default
+  toolsets: [coding, kanban]
   working_directory: .
 zulip:
   site: https://zulip.example.com
@@ -170,7 +175,7 @@ response:
 
                 self.assertEqual(env["HERMES_BIN"], "hermes")
                 self.assertEqual(env["HERMES_CWD"], ".")
-                self.assertEqual(env["HERMES_EXTRA_ARGS"], "--profile default")
+                self.assertEqual(env["HERMES_EXTRA_ARGS"], "--profile default --toolsets coding,kanban")
                 self.assertEqual(env["HERMES_ZULIP_STREAMS"], "hermes")
                 self.assertEqual(env["HERMES_ZULIP_STREAM_IDS"], "12345")
                 self.assertEqual(env["HERMES_ZULIP_TOPICS"], "Staging")
@@ -194,6 +199,7 @@ response:
     def test_validate_config_reports_missing_required_fields(self) -> None:
         issues = validate_config({"zulip": {"site": "https://example.zulip.com"}})
         self.assertIn("hermes.command is required", issues)
+        self.assertIn("hermes.toolsets must contain at least one restricted Hermes toolset", issues)
         self.assertIn("zulip.bot_email or zulip.bot_email_env is required unless zulip.zuliprc is set", issues)
         self.assertIn("zulip.bot_api_key_env is required unless zulip.zuliprc is set", issues)
         self.assertIn("zulip.allowed_senders must contain at least one id:<user-id> or email:<address>", issues)
@@ -201,7 +207,7 @@ response:
         self.assertIn("zulip.topic_policy must be 'any' or 'allowlist'", issues)
 
     def test_security_policy_rejects_malformed_senders_streams_and_empty_topic_allowlist(self) -> None:
-        base = {"hermes": {"command": "/bin/true"}, "zulip": {"zuliprc": "/tmp/test.zuliprc"}}
+        base = {"hermes": secure_hermes(), "zulip": {"zuliprc": "/tmp/test.zuliprc"}}
         issues = validate_config(
             {
                 **base,
@@ -217,9 +223,30 @@ response:
         self.assertIn("zulip.stream_id values must be positive integers", issues)
         self.assertIn("zulip.topic_allowlist is required when topic_policy is 'allowlist'", issues)
 
+    def test_security_policy_requires_restricted_toolsets_and_blocks_argument_bypasses(self) -> None:
+        base = {"zulip": secure_zulip(zuliprc="/tmp/test.zuliprc")}
+        self.assertIn(
+            "hermes.toolsets must contain at least one restricted Hermes toolset",
+            validate_config({**base, "hermes": {"command": "/bin/true"}}),
+        )
+        self.assertIn(
+            "hermes.toolsets may not include all",
+            validate_config({**base, "hermes": secure_hermes(toolsets=["all"])}),
+        )
+        self.assertIn(
+            "hermes.toolsets entries must contain only letters, numbers, underscores, or hyphens",
+            validate_config({**base, "hermes": secure_hermes(toolsets=["coding,all"])}),
+        )
+        for extra_args in (["--yolo"], ["-t", "all"], ["--toolsets=all"]):
+            with self.subTest(extra_args=extra_args):
+                self.assertIn(
+                    "hermes.extra_args may not override toolsets or enable --yolo",
+                    validate_config({**base, "hermes": secure_hermes(extra_args=extra_args)}),
+                )
+
     def test_notifier_exports_the_same_destination_and_sender_policy(self) -> None:
         config = {
-            "hermes": {"command": "/bin/true"},
+            "hermes": secure_hermes(),
             "zulip": secure_zulip(zuliprc="/tmp/test.zuliprc"),
             "notifier": {
                 "allow_direct_messages": True,
@@ -238,7 +265,7 @@ response:
 
     def test_poll_failure_limit_is_configurable_and_must_be_positive_integer(self) -> None:
         base = {
-            "hermes": {"command": "/bin/true"},
+            "hermes": secure_hermes(),
             "zulip": secure_zulip(zuliprc="/tmp/test.zuliprc"),
         }
         for value in (0, -1, True, 1.5, "3"):
@@ -256,7 +283,7 @@ response:
             state_dir = Path(tmpdir) / "not-created"
             config = {
                 "instance_name": "My Bridge",
-                "hermes": {"command": "/bin/true"},
+                "hermes": secure_hermes(),
                 "zulip": secure_zulip(zuliprc="/tmp/test.zuliprc"),
                 "bridge": {"state_directory": str(state_dir)},
             }
@@ -282,7 +309,7 @@ response:
             custom_alias.symlink_to(custom, target_is_directory=True)
             base = {
                 "instance_name": "bridge",
-                "hermes": {"command": "/bin/true"},
+                "hermes": secure_hermes(),
                 "zulip": secure_zulip(zuliprc="/tmp/test.zuliprc"),
                 "bridge": {"state_directory": str(current)},
             }
@@ -322,7 +349,7 @@ response:
             destination.symlink_to(sentinel)
             config = {
                 "instance_name": "safe",
-                "hermes": {"command": "/bin/true"},
+                "hermes": secure_hermes(),
                 "zulip": secure_zulip(**{
                     "site": "https://zulip.example.com",
                     "bot_email": "bot@example.com",
@@ -343,7 +370,7 @@ response:
 
     def test_all_configured_credential_source_names_are_exported_for_child_blocking(self) -> None:
         config = {
-            "hermes": {"command": "/bin/true", "env_allowlist": ["REALM_URL", "BOT_LOGIN", "BOT_TOKEN"]},
+            "hermes": secure_hermes(env_allowlist=["REALM_URL", "BOT_LOGIN", "BOT_TOKEN"]),
             "zulip": secure_zulip(**{
                 "site_env": "REALM_URL",
                 "bot_email_env": "BOT_LOGIN",
@@ -368,7 +395,7 @@ response:
             state = root / "state.json"
             public_lock, anchor, _guard = process_lock_bundle_paths(state)
             base = {
-                "hermes": {"command": "/bin/true"},
+                "hermes": secure_hermes(),
                 "zulip": {"zuliprc": "/tmp/test.zuliprc"},
                 "bridge": {"state_path": str(state)},
             }

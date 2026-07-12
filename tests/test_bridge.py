@@ -1303,6 +1303,8 @@ with bridge.process_lock(Path(sys.argv[1])):
             ALLOWED_SENDERS={"id:17"},
         ):
             self.assertTrue(bridge.should_process(message, "bot@example.com"))
+            without_optional_bot_flag = {key: value for key, value in message.items() if key != "sender_is_bot"}
+            self.assertTrue(bridge.should_process(without_optional_bot_flag, "bot@example.com"))
 
     def test_direct_bot_mention_is_server_flagged_and_removed_from_payload(self) -> None:
         direct = user_message(1, 7, "Topic", content="@**Hermes** /goal status")
@@ -6612,7 +6614,6 @@ with bridge.process_lock(Path(sys.argv[1])):
         variants = {
             "missing-id": {key: value for key, value in base.items() if key != "sender_id"},
             "missing-email": {key: value for key, value in base.items() if key != "sender_email"},
-            "missing-bot": {key: value for key, value in base.items() if key != "sender_is_bot"},
             "changed-id": {**base, "sender_id": 18},
             "changed-email": {**base, "sender_email": "other@example.com"},
             "bot": {**base, "sender_is_bot": True},

@@ -475,7 +475,8 @@ def _normalized_sender_entries(entries: set[str]) -> set[str] | None:
 
 def sender_is_allowed(message: dict, entries: set[str] | None = None) -> bool:
     allowed = _normalized_sender_entries(ALLOWED_SENDERS if entries is None else entries)
-    if not allowed or message.get("sender_is_bot") is not False:
+    sender_is_bot = message.get("sender_is_bot")
+    if not allowed or sender_is_bot is True or (sender_is_bot is not None and type(sender_is_bot) is not bool):
         return False
     sender_id = strict_positive_int(message.get("sender_id"))
     sender_email = str(message.get("sender_email") or "").strip().casefold()
@@ -4405,7 +4406,7 @@ def _admitted_origin_scope(message: dict) -> dict:
     if sender_id is None:
         raise ReplyRoutingError("admitted Zulip message has no complete sender identity", retryable=True)
     sender_is_bot = message.get("sender_is_bot")
-    if type(sender_is_bot) is not bool:
+    if sender_is_bot is True or (sender_is_bot is not None and type(sender_is_bot) is not bool):
         raise ReplyRoutingError("admitted Zulip message has no complete sender authorization", retryable=True)
     topic = message.get("subject") if message.get("subject") is not None else message.get("topic")
     if (
@@ -4422,7 +4423,6 @@ def _admitted_origin_scope(message: dict) -> dict:
         "native_id": native_zulip_thread_id(message),
         "sender_id": sender_id,
         "sender_email": sender_email,
-        "sender_is_bot": sender_is_bot,
     }
     message["_zulip_admitted_origin"] = scope
     return scope
@@ -4437,7 +4437,8 @@ def _validated_generation_origin(rc: dict[str, str], message: dict) -> dict:
             f"origin message {message.get('id')} has no complete live content",
             retryable=True,
         )
-    if not isinstance(origin.get("sender_is_bot"), bool):
+    sender_is_bot = origin.get("sender_is_bot")
+    if sender_is_bot is True or (sender_is_bot is not None and type(sender_is_bot) is not bool):
         raise ReplyRoutingError(
             f"origin message {message.get('id')} has no complete sender authorization",
             retryable=True,
@@ -4455,8 +4456,6 @@ def _validated_generation_origin(rc: dict[str, str], message: dict) -> dict:
         or native_zulip_thread_id(origin) != admitted["native_id"]
     ):
         raise ReplyRoutingError(f"origin message {message.get('id')} moved after admission")
-    if origin.get("sender_is_bot") is not admitted["sender_is_bot"]:
-        raise ReplyRoutingError(f"origin message {message.get('id')} sender changed after admission")
     if sender_email != admitted["sender_email"] or (
         admitted["sender_id"] is not None and sender_id != admitted["sender_id"]
     ):
@@ -4552,11 +4551,11 @@ def topic_history(rc: dict[str, str], message: dict) -> str:
             or not isinstance(content, str)
             or not content.strip()
             or not isinstance(sender_email, str)
-            or type(sender_is_bot) is not bool
+            or (sender_is_bot is not None and type(sender_is_bot) is not bool)
         ):
             raise ReplyRoutingError(f"ambiguous Zulip topic-history response for {stream_id}/{topic}")
         seen_ids.add(member_id)
-        own_bot_message = sender_is_bot and sender_email.strip().casefold() == str(rc.get("email") or "").strip().casefold()
+        own_bot_message = sender_email.strip().casefold() == str(rc.get("email") or "").strip().casefold()
         if member_id < current_id and (own_bot_message or sender_is_allowed(member)):
             messages.append(member)
     if len(messages) > 30:
@@ -4731,7 +4730,6 @@ def refresh_generation_origin(rc: dict[str, str], message: dict) -> dict:
             "native_id": native_zulip_thread_id(origin),
             "sender_id": strict_positive_int(origin.get("sender_id")),
             "sender_email": str(origin.get("sender_email") or "").strip().casefold(),
-            "sender_is_bot": origin["sender_is_bot"],
         }
         message["_zulip_generation_reservation"] = reservation
         return origin
@@ -4762,8 +4760,6 @@ def validate_generation_destination(message: dict, origin: dict) -> None:
         or str(generated.get("thread_id") or "") != str(conversation.get("thread_id") or "")
         or (generated_session and generated_session != str(conversation.get("session_id") or ""))
         or str(generated.get("sender_email") or "") != origin_sender_email
-        or type(generated.get("sender_is_bot")) is not bool
-        or generated.get("sender_is_bot") is not origin.get("sender_is_bot")
         or (
             strict_positive_int(generated.get("sender_id")) is not None
             and strict_positive_int(generated.get("sender_id")) != origin_sender_id

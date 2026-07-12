@@ -27,6 +27,9 @@ from hermes_zulip_bridge.locking import PROCESS_LOCK_FAILED, PROCESS_LOCK_UNAVAI
 class CliLockTests(unittest.TestCase):
     def write_config(self, path: Path, config: dict) -> None:
         prepared = json.loads(json.dumps(config))
+        hermes = prepared.setdefault("hermes", {})
+        if isinstance(hermes, dict):
+            hermes.setdefault("toolsets", ["coding"])
         zulip = prepared.setdefault("zulip", {})
         if isinstance(zulip, dict):
             zulip.setdefault("allowed_senders", ["id:17"])
@@ -299,7 +302,11 @@ class CliLockTests(unittest.TestCase):
 
     def test_documented_smoke_command_parses_with_human_origin_placeholder_filled(self) -> None:
         readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
-        matched = re.search(r"```bash\n(hermes-zulip-bridge .*?--human-origin-message-id <ID> .*?)\n```", readme, re.S)
+        matched = re.search(
+            r"```bash\n(hermes-zulip-bridge [^\n]* smoke-test .*?--human-origin-message-id <ID> .*?)\n```",
+            readme,
+            re.S,
+        )
         self.assertIsNotNone(matched)
         command = matched.group(1).replace("\\\n", " ").replace("<ID>", "456")
         argv = shlex.split(command)

@@ -224,7 +224,8 @@ def _verified_origin(rc: dict[str, str], origin_message_id: int, stream_id: int)
         or not topic
         or strict_positive_int(message.get("sender_id")) is None
         or not sender_email
-        or message.get("sender_is_bot") is not False
+        or message.get("sender_is_bot") is True
+        or (message.get("sender_is_bot") is not None and type(message.get("sender_is_bot")) is not bool)
         or sender_email == str(rc.get("email") or "")
     ):
         raise RouteError("origin message scope is invalid")

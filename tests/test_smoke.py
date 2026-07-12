@@ -1315,7 +1315,7 @@ with bridge.process_lock(Path(sys.argv[1])):
 
     def test_smoke_rejects_bot_self_incomplete_or_moved_human_origins_before_hermes(self) -> None:
         cases = {
-            "bot-probe": (123, stream_message(123, "probe", sender_id=99, sender_email="bot@example.com", sender_is_bot=True), "authorized human"),
+            "bot-probe": (123, stream_message(123, "probe", sender_id=99, sender_email="bot@example.com", sender_is_bot=True), "incomplete sender identity"),
             "self": (456, stream_message(456, "human", sender_email="bot@example.com"), "authorized human"),
             "missing-id": (
                 456,

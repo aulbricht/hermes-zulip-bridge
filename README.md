@@ -40,6 +40,8 @@ hermes:
   command: hermes
   # Use a dedicated profile with the minimum tools and workspaces required by chat.
   profile: restricted-chat
+  # Required. `all` and command-line overrides are rejected.
+  toolsets: [coding]
   working_directory: .
   # Optional names needed by a custom Hermes runtime; Zulip variables are always excluded.
   env_allowlist: [CUSTOM_RUNTIME_SETTING]
@@ -100,7 +102,7 @@ Run the bridge only in a private, operator-only Zulip channel. New turns and sla
 
 Only exact `/status` and `/goal status` messages are chat-safe by default. State-changing slash commands are refused unless both the sender and command are explicitly listed under `bridge.privileged_senders` and `bridge.privileged_slash_commands`; `*` permits every known command for those privileged senders.
 
-The bridge fences chat, attachment, route, history, and steering text as untrusted prompt data and excludes non-allowlisted human messages from topic history. Fencing does not make a tool-capable model immune to prompt injection. Use a dedicated Hermes profile, OS account, container, or equivalent execution boundary that limits filesystem, process, and network capabilities to what chat-originated work actually needs.
+The bridge fences chat, attachment, route, history, and steering text as untrusted prompt data and excludes non-allowlisted human messages from topic history. Fencing does not make a tool-capable model immune to prompt injection. Every config must declare a restricted `hermes.toolsets` list; `all`, `--toolsets` overrides, and `--yolo` are rejected. A toolset is still not an OS sandbox, so use a dedicated Hermes profile, OS account, container, or equivalent execution boundary when chat-originated work must not inherit the bridge account's filesystem, process, or network access.
 
 Notifier callbacks accept targets only from structured task metadata. Stream targets must match the configured numeric stream and sender policies. Direct messages are disabled by default; enable them with `notifier.allow_direct_messages: true` and a nonempty `notifier.allowed_dm_recipients` list of `id:`/`email:` identities.
 

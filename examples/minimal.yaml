@@ -1,6 +1,7 @@
 instance_name: hermes
 hermes:
   command: hermes
+  toolsets: [coding]
 zulip:
   site: https://example.zulip.com
   bot_email_env: ZULIP_BOT_EMAIL

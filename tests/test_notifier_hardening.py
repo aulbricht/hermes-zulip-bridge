@@ -348,15 +348,18 @@ class NotifierHardeningTests(unittest.TestCase):
                 post.assert_not_called()
                 self.assertEqual(state["outbox"][0]["stage"], "admitted")
 
-    def test_origin_requires_sender_is_bot_exactly_false(self) -> None:
+    def test_origin_accepts_absent_optional_bot_flag_but_rejects_true_or_malformed_values(self) -> None:
         with mock.patch.object(notifier, "fetch_zulip_message", return_value=origin()):
             self.assertEqual(notifier._verified_origin(RC, 41, 7)["id"], 41)
 
         missing = origin()
         missing.pop("sender_is_bot")
+        for candidate in (missing, {**origin(), "sender_is_bot": None}):
+            with self.subTest(sender_is_bot=candidate.get("sender_is_bot", "missing")), mock.patch.object(
+                notifier, "fetch_zulip_message", return_value=candidate
+            ):
+                self.assertEqual(notifier._verified_origin(RC, 41, 7)["id"], 41)
         cases = (
-            missing,
-            {**origin(), "sender_is_bot": None},
             {**origin(), "sender_is_bot": 0},
             {**origin(), "sender_is_bot": 1},
             {**origin(), "sender_is_bot": ""},

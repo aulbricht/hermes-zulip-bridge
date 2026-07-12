@@ -3,6 +3,7 @@ agent_name: Hermes
 hermes:
   command: hermes
   profile: restricted-chat
+  toolsets: [coding]
   working_directory: .
   timeout_seconds: 1800
 zulip:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import configparser
 import json
 import os
+import re
 import shlex
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,22 @@ def validate_config(config: dict[str, Any], *, require_secret: bool = False) -> 
     hermes = _section(config, "hermes")
     if config and not (hermes.get("command") or hermes.get("executable")):
         issues.append("hermes.command is required")
+    toolsets = _list(hermes.get("toolsets"))
+    if config and not toolsets:
+        issues.append("hermes.toolsets must contain at least one restricted Hermes toolset")
+    if any(not re.fullmatch(r"[A-Za-z0-9_-]+", str(value)) for value in toolsets):
+        issues.append("hermes.toolsets entries must contain only letters, numbers, underscores, or hyphens")
+    if any(str(value).casefold() == "all" for value in toolsets):
+        issues.append("hermes.toolsets may not include all")
+    extra_args = _list(hermes.get("extra_args"))
+    if any(
+        str(value).startswith("-t")
+        or str(value) == "--toolsets"
+        or str(value).startswith("--toolsets=")
+        or str(value).startswith("--yolo")
+        for value in extra_args
+    ):
+        issues.append("hermes.extra_args may not override toolsets or enable --yolo")
     bridge = _section(config, "bridge")
     poll_failure_limit = bridge.get("poll_failure_limit", bridge.get("max_poll_failures"))
     if poll_failure_limit is not None and (
@@ -154,7 +171,7 @@ def apply_bridge_env(
     env["HERMES_CWD"] = str(_path(hermes.get("working_directory") or hermes.get("cwd") or Path.home()))
     env["HERMES_STATE_DB"] = str(_path(hermes.get("state_db") or Path.home() / ".hermes/state.db"))
     env["HERMES_TIMEOUT_SECONDS"] = str(hermes.get("timeout_seconds") or hermes.get("timeout") or 1800)
-    extra_args = _list(hermes.get("extra_args"))
+    extra_args = ["--toolsets", ",".join(_list(hermes.get("toolsets"))), *_list(hermes.get("extra_args"))]
     if hermes.get("profile"):
         extra_args = ["--profile", str(hermes["profile"]), *extra_args]
     env["HERMES_EXTRA_ARGS"] = shlex.join(extra_args)
