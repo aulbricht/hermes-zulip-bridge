@@ -323,6 +323,44 @@ class ZulipAttachmentTests(unittest.TestCase):
             ],
         )
 
+    def test_matches_narrow_request_is_json_encoded_for_official_client(self) -> None:
+        calls: list[dict[str, object]] = []
+        rc = {"site": "https://zulip.example.com", "email": "bot@example.com", "key": "test-api-key"}
+        original_cache = dict(bridge.ZULIP_CLIENT_CACHE)
+
+        class FakeClient:
+            def call_endpoint(self, **kwargs: object) -> dict:
+                calls.append(kwargs)
+                return {"result": "success", "msg": "", "messages": {}}
+
+        try:
+            bridge.ZULIP_CLIENT_CACHE.clear()
+            bridge.ZULIP_CLIENT_CACHE[("https://zulip.example.com", "bot@example.com", "test-api-key")] = FakeClient()
+            bridge.api(
+                rc,
+                "GET",
+                "/api/v1/messages/matches_narrow",
+                params={
+                    "msg_ids": [1, 2],
+                    "narrow": [
+                        {"operator": "channel", "operand": 616350},
+                        {"operator": "topic", "operand": "Initial setup"},
+                    ],
+                },
+            )
+        finally:
+            bridge.ZULIP_CLIENT_CACHE.clear()
+            bridge.ZULIP_CLIENT_CACHE.update(original_cache)
+
+        request = calls[0]["request"]
+        self.assertEqual(
+            request,
+            {
+                "msg_ids": "[1, 2]",
+                "narrow": '[{"operator": "channel", "operand": 616350}, {"operator": "topic", "operand": "Initial setup"}]',
+            },
+        )
+
     def test_official_client_disables_transport_retries_for_inline_and_zuliprc_credentials(self) -> None:
         constructed: list[dict[str, object]] = []
         clients: list[Client] = []
@@ -2368,6 +2406,22 @@ with bridge.process_lock(Path(sys.argv[1])):
             ],
         )
 
+    def test_anchor_lookup_accepts_current_zulip_match_details(self) -> None:
+        state = {"topic_sessions": {}}
+        original = self.seed_topic(state, message_id=50, stream_id=1, topic="Original", session_id="s1")
+
+        def fake_api(_rc: dict, method: str, path: str, **kwargs: object) -> dict:
+            self.assertEqual((method, path), ("GET", "/api/v1/messages/matches_narrow"))
+            self.assertEqual((kwargs.get("params") or {}).get("msg_ids"), [50])
+            return zulip_success(messages={"50": {"match_content": "hello", "match_subject": "Renamed"}})
+
+        message = {"id": 51, "type": "stream", "stream_id": 1, "display_recipient": "stream-1", "topic": "Renamed"}
+        with mock.patch.object(bridge, "api", fake_api):
+            session_id, renamed = bridge.resolve_session(message, {}, state, "example", {"site": "https://zulip.example.com"})
+
+        self.assertEqual(session_id, "s1")
+        self.assertEqual(renamed["thread_id"], original["thread_id"])
+
     def test_anchor_batches_are_bounded_and_second_batch_match_prevents_false_fork(self) -> None:
         state = {
             "realm": "example",
@@ -3776,6 +3830,12 @@ with bridge.process_lock(Path(sys.argv[1])):
         self.assertEqual(session_id, "s2")
         self.assertEqual(replies, [("continuing", "s1"), ("continued", "s2"), ("done", "s2")])
         hermes_reply.assert_called_once()
+
+    def test_missing_goal_manager_does_not_block_normal_turn(self) -> None:
+        error = ModuleNotFoundError("No module named 'hermes_cli'", name="hermes_cli")
+
+        with mock.patch.object(bridge, "goal_manager", side_effect=error):
+            self.assertIsNone(bridge.goal_decision_after_turn("s1", "answered"))
 
     def test_goal_slash_sets_goal_and_kicks_off_prompt(self) -> None:
         original_hermes_reply = bridge.hermes_reply

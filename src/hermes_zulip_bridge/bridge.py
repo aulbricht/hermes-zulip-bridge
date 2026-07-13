@@ -736,6 +736,12 @@ def api(rc: dict[str, str], method: str, path: str, params: dict | None = None, 
     authentication, and error handling flow through Zulip's maintained client.
     """
     request = params if method.upper() == "GET" else data
+    if method.upper() == "GET" and _zulip_endpoint(path) == "messages/matches_narrow" and isinstance(request, dict):
+        request = {
+            **request,
+            "msg_ids": json.dumps(request["msg_ids"]) if isinstance(request.get("msg_ids"), list) else request.get("msg_ids"),
+            "narrow": json.dumps(request["narrow"]) if isinstance(request.get("narrow"), list) else request.get("narrow"),
+        }
     try:
         payload = zulip_client(rc).call_endpoint(
             url=_zulip_endpoint(path),
@@ -3868,7 +3874,7 @@ def _thread_for_matching_anchors(rc: dict[str, str], state: dict, message: dict,
         ):
             raise ReplyRoutingError(f"ambiguous Hermes message-anchor response for Zulip topic {stream_id}/{topic}")
         matches = payload.get("messages")
-        if not isinstance(matches, dict) or any(type(value) is not bool for value in matches.values()):
+        if not isinstance(matches, dict):
             raise ReplyRoutingError(f"ambiguous Hermes message-anchor response for Zulip topic {stream_id}/{topic}")
         parsed_matches = [strict_positive_int(message_id) for message_id in matches]
         if any(message_id is None for message_id in parsed_matches):
@@ -3876,11 +3882,15 @@ def _thread_for_matching_anchors(rc: dict[str, str], state: dict, message: dict,
         response_ids = {message_id for message_id in parsed_matches if message_id is not None}
         if len(response_ids) != len(matches) or not response_ids.issubset(batch):
             raise ReplyRoutingError(f"ambiguous Hermes message-anchor response for Zulip topic {stream_id}/{topic}")
-        batch_matches = {
-            message_id
-            for raw_message_id, matched in matches.items()
-            if matched and (message_id := strict_positive_int(raw_message_id)) is not None
-        }
+        batch_matches = set()
+        for raw_message_id, matched in matches.items():
+            message_id = strict_positive_int(raw_message_id)
+            if message_id is None:
+                raise ReplyRoutingError(f"ambiguous Hermes message-anchor response for Zulip topic {stream_id}/{topic}")
+            if matched is True or isinstance(matched, dict):
+                batch_matches.add(message_id)
+            elif matched is not False:
+                raise ReplyRoutingError(f"ambiguous Hermes message-anchor response for Zulip topic {stream_id}/{topic}")
         matched_anchors.update(batch_matches)
     return _unique_owner(
         (thread_id for anchor in matched_anchors for thread_id in anchors[anchor]),
@@ -5653,8 +5663,8 @@ def is_readonly_goal_slash(message: dict) -> bool:
 def goal_decision_after_turn(session_id: str | None, last_response: str) -> dict[str, Any] | None:
     if not session_id or not str(last_response or "").strip():
         return None
-    mgr = goal_manager(session_id)
     try:
+        mgr = goal_manager(session_id)
         if not mgr.is_active():
             return None
         return mgr.evaluate_after_turn(
@@ -5662,6 +5672,11 @@ def goal_decision_after_turn(session_id: str | None, last_response: str) -> dict
             user_initiated=True,
             background_processes=goal_background_processes(),
         )
+    except ModuleNotFoundError as exc:
+        if str(getattr(exc, "name", "")).split(".", 1)[0] == "hermes_cli":
+            log("goal_manager_unavailable", session_id, exception_ref(exc))
+            return None
+        raise
     except Exception as exc:
         log("goal_evaluate_failed", session_id, exception_ref(exc))
         return {"message": f"{BOT_NAME} goal loop error. Please try again.", "should_continue": False}
