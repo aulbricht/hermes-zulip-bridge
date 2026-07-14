@@ -6250,20 +6250,31 @@ def _demo() -> None:
     assert different_conv["conversation_key"] != conv["conversation_key"]
 
 
-def should_process(message: dict, bot_email: str, *, require_policy: bool = True) -> bool:
+def message_rejection_event(
+    message: dict,
+    bot_email: str,
+    *,
+    require_policy: bool = True,
+) -> str | None:
     if require_policy and not authorization_policy_configured():
-        return False
+        return "message_rejected_policy_unconfigured"
     if not allowed_stream_topic(message):
-        return False
+        return "message_rejected_route"
     if not sender_is_allowed(message):
-        return False
+        return "message_rejected_sender"
     sender = str(message.get("sender_email") or "").strip().casefold()
     if sender == str(bot_email or "").strip().casefold():
-        return False
+        return "message_rejected_self"
     content = str(message.get("content") or "").strip()
     if any(pattern in content for pattern in IGNORE_CONTENT_PATTERNS):
-        return False
-    return bool(content)
+        return "message_rejected_content_policy"
+    if not content:
+        return "message_rejected_empty"
+    return None
+
+
+def should_process(message: dict, bot_email: str, *, require_policy: bool = True) -> bool:
+    return message_rejection_event(message, bot_email, require_policy=require_policy) is None
 
 
 def validated_active_steering_message(rc: dict[str, str], message: dict) -> dict:
@@ -7089,14 +7100,15 @@ def _main(
         if not candidates:
             return
 
-        ignored: list[int] = []
+        ignored: list[tuple[int, str]] = []
         route_failures: list[tuple[int, ReplyRoutingError]] = []
         prepared: list[tuple[dict, str | None, dict, object | None]] = []
         try:
             for message in candidates:
                 mid = message["id"]
-                if not should_process(message, rc["email"]):
-                    ignored.append(mid)
+                rejection_event = message_rejection_event(message, rc["email"])
+                if rejection_event is not None:
+                    ignored.append((mid, rejection_event))
                     continue
                 try:
                     session_id, conversation = resolve_session(
@@ -7114,16 +7126,16 @@ def _main(
                         active_message = active_senders.get(key)
                         if not isinstance(active_message, dict) or not message_can_activate(message, active_message):
                             release_destination_reservation(state, reservation)
-                            ignored.append(mid)
+                            ignored.append((mid, "message_rejected_active_sender"))
                             continue
                         message["_zulip_is_steering"] = True
                     elif REQUIRE_MENTION and not verify_live_direct_mention(rc, message):
                         release_destination_reservation(state, reservation)
-                        ignored.append(mid)
+                        ignored.append((mid, "message_rejected_mention"))
                         continue
                     elif not message_can_activate(message):
                         release_destination_reservation(state, reservation)
-                        ignored.append(mid)
+                        ignored.append((mid, "message_rejected_activation"))
                         continue
                     message["_zulip_bot_name"] = ZULIP_BOT_NAME
                     message["_zulip_bot_user_id"] = ZULIP_BOT_USER_ID
@@ -7145,12 +7157,15 @@ def _main(
                 if len(state.get("reply_reconciliations", [])) + len(pending) + len(prepared) > MAX_REPLY_RECONCILIATIONS:
                     raise DurableQueueFull("Hermes Zulip reply reconciliation queue cannot admit the fetched page")
 
+            for mid, event in ignored:
+                log(event, mid)
+
             before = copy.deepcopy(state)
             before_seen = set(seen)
             before_generation = _ownership_generation(state)
             admitted: list[tuple[dict, str | None, dict, dict]] = []
             try:
-                for mid in ignored:
+                for mid, _event in ignored:
                     seen.add(mid)
                     _remove_origin_retry(state, mid)
                 for mid, exc in route_failures:

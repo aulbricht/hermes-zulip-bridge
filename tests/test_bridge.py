@@ -1382,6 +1382,48 @@ with bridge.process_lock(Path(sys.argv[1])):
             without_optional_bot_flag = {key: value for key, value in message.items() if key != "sender_is_bot"}
             self.assertTrue(bridge.should_process(without_optional_bot_flag, "bot@example.com"))
 
+    def test_admission_rejection_events_are_specific_and_contain_no_user_data(self) -> None:
+        message = user_message(1, 7, "Topic", content="private message text")
+        cases = (
+            (
+                "message_rejected_policy_unconfigured",
+                dict(ALLOW_STREAM_IDS=set(), TOPIC_POLICY="", ALLOWED_SENDERS=set()),
+                message,
+            ),
+            (
+                "message_rejected_route",
+                dict(ALLOW_STREAM_IDS={"8"}, TOPIC_POLICY="any", ALLOWED_SENDERS={"id:17"}),
+                message,
+            ),
+            (
+                "message_rejected_sender",
+                dict(ALLOW_STREAM_IDS={"7"}, TOPIC_POLICY="any", ALLOWED_SENDERS={"id:18"}),
+                message,
+            ),
+            (
+                "message_rejected_content_policy",
+                dict(ALLOW_STREAM_IDS={"7"}, TOPIC_POLICY="any", ALLOWED_SENDERS={"id:17"}),
+                message,
+            ),
+            (
+                "message_rejected_empty",
+                dict(ALLOW_STREAM_IDS={"7"}, TOPIC_POLICY="any", ALLOWED_SENDERS={"id:17"}),
+                {**message, "content": "   "},
+            ),
+        )
+        for event, policy, candidate in cases:
+            patterns = ["private message"] if event == "message_rejected_content_policy" else []
+            with self.subTest(event=event), mock.patch.multiple(
+                bridge,
+                ALLOW_STREAMS=set(),
+                ALLOW_TOPICS=set(),
+                IGNORE_CONTENT_PATTERNS=patterns,
+                **policy,
+            ):
+                self.assertEqual(bridge.message_rejection_event(candidate, "bot@example.com"), event)
+                self.assertNotIn(candidate["sender_email"], event)
+                self.assertNotIn(str(candidate.get("content") or ""), event)
+
     def test_direct_bot_mention_is_server_flagged_and_removed_from_payload(self) -> None:
         direct = user_message(1, 7, "Topic", content="@**Hermes** /goal status")
         direct["flags"] = ["mentioned"]
@@ -7412,6 +7454,126 @@ with bridge.process_lock(Path(sys.argv[1])):
                 bridge.ZulipResponseError
             ):
                 bridge.latest_messages({})
+
+    def test_latest_messages_polls_every_message_visible_to_the_bot(self) -> None:
+        unauthorized = {
+            **user_message(44, 1, "Topic", content="must remain private"),
+            "sender_id": 18,
+            "sender_email": "other@example.com",
+        }
+        endpoint = mock.Mock(return_value=zulip_success(messages=[unauthorized]))
+        with mock.patch.object(bridge, "api", endpoint):
+            self.assertEqual(bridge.latest_messages({}), [unauthorized])
+        params = endpoint.call_args.kwargs["params"]
+        self.assertNotIn("narrow", params)
+
+    def test_unauthorized_visible_message_is_logged_once_and_never_executed(self) -> None:
+        state = {"topic_sessions": {}}
+        unauthorized = {
+            **user_message(44, 1, "Topic", content="must remain private"),
+            "sender_id": 18,
+            "sender_email": "other@example.com",
+        }
+        logs: list[tuple[object, ...]] = []
+
+        class Executor:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            def submit(self, *_args: object) -> object:
+                raise AssertionError("unauthorized message reached the worker pool")
+
+            def shutdown(self, **_kwargs: object) -> None:
+                pass
+
+        route = mock.Mock(side_effect=AssertionError("unauthorized message reached session routing"))
+        worker = mock.Mock(side_effect=AssertionError("unauthorized message reached Hermes"))
+        reaction = mock.Mock(side_effect=AssertionError("unauthorized message received a reaction"))
+        slash = mock.Mock(side_effect=AssertionError("unauthorized message reached slash routing"))
+        latest = mock.Mock(return_value=[unauthorized])
+        with (
+            mock.patch.object(bridge, "load_json", return_value=state),
+            mock.patch.object(
+                bridge,
+                "load_rc",
+                return_value={"site": "https://example", "email": "bot@example.com", "key": BOT_KEY},
+            ),
+            mock.patch.object(bridge, "load_alias_entries", return_value=[]),
+            mock.patch.object(bridge, "load_state_signing_key", return_value=SIGNING_KEY),
+            mock.patch.object(bridge, "latest_messages", latest),
+            mock.patch.object(bridge, "resolve_session", route),
+            mock.patch.object(bridge, "handle_message", worker),
+            mock.patch.object(bridge, "add_reaction", reaction),
+            mock.patch.object(bridge, "hermes_slash_reply", slash),
+            mock.patch.object(bridge, "save_json"),
+            mock.patch.object(bridge, "log", side_effect=lambda *parts: logs.append(parts)),
+            mock.patch.object(bridge.concurrent.futures, "ThreadPoolExecutor", Executor),
+            mock.patch.object(bridge.time, "sleep", side_effect=[None, KeyboardInterrupt]),
+        ):
+            self.assertEqual(bridge._main(), 0)
+
+        self.assertEqual(latest.call_count, 2)
+        self.assertEqual(logs.count(("message_rejected_sender", 44)), 1)
+        self.assertNotIn("other@example.com", repr(logs))
+        self.assertNotIn("must remain private", repr(logs))
+        self.assertIn(44, state["seen_ids"])
+        route.assert_not_called()
+        worker.assert_not_called()
+        reaction.assert_not_called()
+        slash.assert_not_called()
+
+    def test_rejection_log_failure_does_not_retire_or_execute_message(self) -> None:
+        state = {"topic_sessions": {}}
+        unauthorized = {
+            **user_message(44, 1, "Topic", content="must remain private"),
+            "sender_id": 18,
+            "sender_email": "other@example.com",
+        }
+        logs: list[tuple[object, ...]] = []
+
+        class Executor:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            def submit(self, *_args: object) -> object:
+                raise AssertionError("unauthorized message reached the worker pool")
+
+            def shutdown(self, **_kwargs: object) -> None:
+                pass
+
+        def audit(*parts: object) -> None:
+            logs.append(parts)
+            if parts[0] == "message_rejected_sender":
+                raise OSError("audit sink unavailable")
+
+        route = mock.Mock(side_effect=AssertionError("unauthorized message reached session routing"))
+        worker = mock.Mock(side_effect=AssertionError("unauthorized message reached Hermes"))
+        with (
+            mock.patch.object(bridge, "load_json", return_value=state),
+            mock.patch.object(
+                bridge,
+                "load_rc",
+                return_value={"site": "https://example", "email": "bot@example.com", "key": BOT_KEY},
+            ),
+            mock.patch.object(bridge, "load_alias_entries", return_value=[]),
+            mock.patch.object(bridge, "load_state_signing_key", return_value=SIGNING_KEY),
+            mock.patch.object(bridge, "latest_messages", return_value=[unauthorized]),
+            mock.patch.object(bridge, "resolve_session", route),
+            mock.patch.object(bridge, "handle_message", worker),
+            mock.patch.object(bridge, "save_json"),
+            mock.patch.object(bridge, "log", side_effect=audit),
+            mock.patch.object(bridge.concurrent.futures, "ThreadPoolExecutor", Executor),
+            mock.patch.object(bridge, "MAX_CONSECUTIVE_POLL_FAILURES", 1),
+            self.assertRaisesRegex(SystemExit, "1 consecutive iteration"),
+        ):
+            bridge._main()
+
+        self.assertEqual(logs.count(("message_rejected_sender", 44)), 1)
+        self.assertNotIn(44, state.get("seen_ids", []))
+        self.assertNotIn("other@example.com", repr(logs))
+        self.assertNotIn("must remain private", repr(logs))
+        route.assert_not_called()
+        worker.assert_not_called()
 
     def test_reconciliation_hmac_forgery_terminalizes_before_api_or_owner_mutation(self) -> None:
         state = {"topic_sessions": {}}
