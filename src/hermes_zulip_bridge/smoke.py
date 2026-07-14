@@ -61,13 +61,21 @@ def run(
         except RuntimeError:
             raise SystemExit("Hermes executable preflight failed") from None
     try:
+        def execute(state_path: Path) -> dict[str, Any]:
+            bridge.freeze_auxiliary_paths(state_path)
+            identity = bridge.refresh_zulip_bot_identity(rc) if bridge.REQUIRE_MENTION else None
+            result = (
+                _run(args, state_path, hermes_launcher, rc, identity)
+                if identity is not None
+                else _run(args, state_path, hermes_launcher, rc)
+            )
+            return public_result(result)
+
         if lock is not None:
             lock.validate(lock.state_path)
-            bridge.freeze_auxiliary_paths(lock.state_path)
-            return public_result(_run(args, lock.state_path, hermes_launcher, rc))
+            return execute(lock.state_path)
         with bridge.process_lock() as held_lock:
-            bridge.freeze_auxiliary_paths(held_lock.state_path)
-            return public_result(_run(args, held_lock.state_path, hermes_launcher, rc))
+            return execute(held_lock.state_path)
     except bridge.ProcessLockError as exc:
         bridge.log("smoke_lock_failed")
         raise SystemExit(bridge.terminal_safe(exc)) from None
@@ -79,7 +87,13 @@ def run(
         raise SystemExit(f"Smoke test failed ({reference})") from None
 
 
-def _run(args: argparse.Namespace, state_path: Path, hermes_launcher: LauncherProof, rc: dict[str, str]) -> dict[str, Any]:
+def _run(
+    args: argparse.Namespace,
+    state_path: Path,
+    hermes_launcher: LauncherProof,
+    rc: dict[str, str],
+    identity: dict | None = None,
+) -> dict[str, Any]:
     state = bridge.require_state_object(
         bridge.load_json(state_path, {"seen_ids": [], "topic_sessions": {}})
     )
@@ -115,10 +129,12 @@ def _run(args: argparse.Namespace, state_path: Path, hermes_launcher: LauncherPr
     )
 
     checks: dict[str, Any] = {"hermes_found": True}
-    me = bridge.api(rc, "GET", "/api/v1/users/me")
+    me = identity if identity is not None else bridge.api(rc, "GET", "/api/v1/users/me")
     checks["zulip_auth_ok"] = bool(str(me.get("email") or "").strip() or bridge.strict_positive_int(me.get("user_id")))
     if not checks["zulip_auth_ok"]:
         raise SystemExit("Zulip authentication preflight failed")
+    if bridge.REQUIRE_MENTION:
+        bridge.configure_zulip_bot_identity(me)
     probe_message = _synthetic_message(stream, args.topic, args.message)
     probe_message["stream_id"] = _stream_id(rc, stream)
     if not bridge.allowed_stream_topic(probe_message):
@@ -210,9 +226,10 @@ def _run(args: argparse.Namespace, state_path: Path, hermes_launcher: LauncherPr
             raise SystemExit("Human smoke origin has incomplete sender identity or content") from exc
         if not bridge.should_process(human, str(rc.get("email") or "")):
             raise SystemExit("Human smoke origin is not an authorized human message")
-        if bridge.REQUIRE_MENTION and not bridge.message_directly_mentions_bot(human):
+        if bridge.REQUIRE_MENTION and not bridge.verify_live_direct_mention(rc, human):
             raise SystemExit("Human smoke origin does not directly mention the Zulip bot")
-        human["_zulip_bot_name"] = bridge.BOT_NAME
+        human["_zulip_bot_name"] = bridge.ZULIP_BOT_NAME
+        human["_zulip_bot_user_id"] = bridge.ZULIP_BOT_USER_ID
         if not bridge.allowed_stream_topic(human):
             raise SystemExit("Human smoke origin is outside the configured Zulip allowlist")
         if not isinstance(state, dict):

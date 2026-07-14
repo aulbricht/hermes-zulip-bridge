@@ -98,7 +98,7 @@ uv run python -m unittest discover -s tests -p 'test_*.py'
 
 The bridge fails closed unless `zulip.allowed_senders`, a positive numeric `zulip.stream_id`/`stream_ids`, and an explicit `zulip.topic_policy` are configured. Sender entries must use `id:<user-id>` or `email:<address>`; numeric user IDs are preferred. Environment-only installations can set the equivalent comma-separated `HERMES_ZULIP_ALLOWED_SENDERS` and `HERMES_ZULIP_STREAM_IDS` variables plus `HERMES_ZULIP_TOPIC_POLICY=any|allowlist`.
 
-Run the bridge only in a private, operator-only Zulip channel. New turns and slash commands require a direct `@` mention of the bot by default. While a turn is active, only the same authorized sender can steer or interrupt it without repeating the mention.
+Run the bridge only in a private, operator-only Zulip channel. New turns and slash commands require a direct `@` mention of the bot by default. The mention identity is discovered from the authenticated Zulip bot account at startup, so changing the bot's display name does not require bridge configuration changes. While a turn is active, only the same authorized sender can steer or interrupt it without repeating the mention.
 
 Only exact `/status` and `/goal status` messages are chat-safe by default. State-changing slash commands are refused unless both the sender and command are explicitly listed under `bridge.privileged_senders` and `bridge.privileged_slash_commands`; `*` permits every known command for those privileged senders.
 

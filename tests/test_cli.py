@@ -716,6 +716,7 @@ class CliLockTests(unittest.TestCase):
                 "    def ensure_session(self): pass\n"
                 "    def call_endpoint(self, **kwargs):\n"
                 "        with Path(os.environ['API_LOG']).open('a') as handle: handle.write(kwargs['url']+'\\n')\n"
+                "        if kwargs['url'] == 'users/me': return {'result':'success','msg':'','email':'bot@example.com','full_name':'Hermes','user_id':99}\n"
                 "        return {'result':'success','msg':'','ignored_parameters_unsupported':[],'messages':[]}\n",
                 encoding="utf-8",
             )
@@ -789,7 +790,8 @@ class CliLockTests(unittest.TestCase):
                 "    def call_endpoint(self, **kwargs):\n"
                 "        self.calls += 1\n"
                 "        with Path(os.environ['API_LOG']).open('a') as handle: handle.write(kwargs['url']+'\\n')\n"
-                "        if self.calls == 1: return {'result':'success','msg':'','ignored_parameters_unsupported':[],'messages':[]}\n"
+                "        if kwargs['url'] == 'users/me': return {'result':'success','msg':'','email':'bot@example.com','full_name':'Hermes','user_id':99}\n"
+                "        if self.calls == 2: return {'result':'success','msg':'','ignored_parameters_unsupported':[],'messages':[]}\n"
                 "        return {'result':'error','msg':'busy','status_code':503}\n",
                 encoding="utf-8",
             )
@@ -820,7 +822,10 @@ class CliLockTests(unittest.TestCase):
                 timeout=10,
             )
             self.assertEqual(completed.returncode, 1, completed.stderr)
-            self.assertEqual(api_log.read_text(encoding="utf-8").splitlines(), ["messages", "messages"])
+            self.assertEqual(
+                api_log.read_text(encoding="utf-8").splitlines(),
+                ["users/me", "messages", "messages"],
+            )
             self.assertFalse(hermes_marker.exists())
             with process_lock(bridge_state_path(config)):
                 pass
@@ -1057,7 +1062,7 @@ class Client:
             handle.write(url + '\\n')
         stage = os.environ['MALFORMED_STAGE']
         if url == 'users/me':
-            return {'result': 'success', 'msg': 'bad'} if stage == 'auth' else {'result': 'success', 'msg': '', 'email': 'bot@example.com'}
+            return {'result': 'success', 'msg': 'bad'} if stage == 'auth' else {'result': 'success', 'msg': '', 'email': 'bot@example.com', 'full_name': 'Hermes', 'user_id': 99}
         if url == 'streams':
             return {'result': 'success'} if stage == 'stream' else {'result': 'success', 'msg': '', 'streams': [{'name': 'hermes', 'stream_id': 7}]}
         if url == 'messages' and kwargs['method'] == 'POST':
@@ -1136,7 +1141,12 @@ class Client:
 
                 with self.subTest(stage=stage):
                     self.assertNotEqual(completed.returncode, 0)
-                    self.assertIn("Smoke test failed (RuntimeError)", completed.stderr)
+                    self.assertIn(
+                        "Zulip bot identity preflight failed"
+                        if stage == "auth"
+                        else "Smoke test failed (RuntimeError)",
+                        completed.stderr,
+                    )
                     self.assertNotIn("canary-secret", completed.stdout + completed.stderr)
                     self.assertEqual(api_log.read_text(encoding="utf-8").splitlines(), expected)
                     self.assertEqual(state_path.read_bytes(), original_state)

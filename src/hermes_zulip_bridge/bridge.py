@@ -37,6 +37,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
 
@@ -129,6 +130,8 @@ MAX_CONSECUTIVE_POLL_FAILURES = int(env_value("HERMES_ZULIP_MAX_POLL_FAILURES", 
 TYPING_REFRESH_SECONDS = float(env_value("HERMES_ZULIP_TYPING_REFRESH_SECONDS", "8", "ZULIP_BRIDGE_TYPING_REFRESH_SECONDS"))
 MAX_WORKERS = int(env_value("HERMES_ZULIP_WORKERS", "2", "ZULIP_BRIDGE_WORKERS"))
 BOT_NAME = env_value("HERMES_ZULIP_BOT_NAME", "Hermes", "ZULIP_BRIDGE_BOT_NAME")
+ZULIP_BOT_NAME = BOT_NAME
+ZULIP_BOT_USER_ID: int | None = None
 ALLOW_STREAMS = {s.strip() for s in env_value("HERMES_ZULIP_STREAMS", "", "ZULIP_BRIDGE_STREAMS").split(",") if s.strip()}
 ALLOW_STREAM_IDS = {s.strip() for s in env_value("HERMES_ZULIP_STREAM_IDS", "", "ZULIP_BRIDGE_STREAM_IDS").split(",") if s.strip()}
 ALLOW_TOPICS = {s.strip() for s in env_value("HERMES_ZULIP_TOPICS", "", "ZULIP_BRIDGE_TOPICS").split(",") if s.strip()}
@@ -515,27 +518,177 @@ def authorization_policy_configured() -> bool:
     )
 
 
-def _bot_mention_pattern(bot_name: str) -> re.Pattern[str] | None:
+def _bot_mention_pattern(bot_name: str, bot_user_id: int | None = None) -> re.Pattern[str] | None:
     name = str(bot_name or "").strip()
     if not name:
         return None
-    return re.compile(rf"@\*\*{re.escape(name)}(?:\|[1-9][0-9]*)?\*\*")
-
-
-def message_directly_mentions_bot(message: dict, bot_name: str = BOT_NAME) -> bool:
-    flags = message.get("flags")
-    pattern = _bot_mention_pattern(bot_name)
-    return bool(
-        isinstance(flags, list)
-        and "mentioned" in flags
-        and pattern is not None
-        and pattern.search(str(message.get("content") or ""))
+    user_id = strict_positive_int(bot_user_id)
+    if user_id is None:
+        return re.compile(rf"@\*\*{re.escape(name)}(?:\|[1-9][0-9]*)?\*\*")
+    return re.compile(
+        rf"@\*\*(?:{re.escape(name)}(?:\|{user_id})?|[^*|\r\n]{{1,100}}\|{user_id})\*\*"
     )
+
+
+class _RenderedMentionParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.mentions: list[tuple[int, str]] = []
+        self._excluded: list[str] = []
+        self._capture: tuple[int, list[str]] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"blockquote", "code", "pre"}:
+            self._excluded.append(tag)
+        if tag != "span" or self._excluded or self._capture is not None:
+            return
+        attributes = dict(attrs)
+        classes = set(str(attributes.get("class") or "").split())
+        user_id = strict_positive_int(attributes.get("data-user-id"))
+        if "user-mention" in classes and "silent" not in classes and user_id is not None:
+            self._capture = (user_id, [])
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "span" and self._capture is not None:
+            user_id, text = self._capture
+            name = "".join(text).strip().removeprefix("@").strip()
+            self.mentions.append((user_id, name))
+            self._capture = None
+        if self._excluded and tag == self._excluded[-1]:
+            self._excluded.pop()
+
+    def handle_data(self, data: str) -> None:
+        if self._capture is not None:
+            self._capture[1].append(data)
+
+
+def _rendered_direct_mentions(content: object) -> list[tuple[int, str]]:
+    if not isinstance(content, str) or len(content) > MAX_MESSAGE_CONTENT_CHARS:
+        return []
+    parser = _RenderedMentionParser()
+    parser.feed(content)
+    parser.close()
+    return parser.mentions
+
+
+def configure_zulip_bot_identity(identity: dict) -> None:
+    global ZULIP_BOT_NAME, ZULIP_BOT_USER_ID
+
+    name = str(identity.get("full_name") or "").strip()
+    user_id = strict_positive_int(identity.get("user_id"))
+    if not name or user_id is None:
+        raise RuntimeError("Authenticated Zulip bot identity is incomplete")
+    ZULIP_BOT_NAME = name
+    ZULIP_BOT_USER_ID = user_id
+
+
+def refresh_zulip_bot_identity(rc: dict[str, str]) -> dict:
+    try:
+        identity = api(rc, "GET", "/api/v1/users/me")
+        configure_zulip_bot_identity(identity)
+        return identity
+    except Exception as exc:
+        log("zulip_bot_identity_failed", exception_ref(exc))
+        raise SystemExit("Zulip bot identity preflight failed") from None
+
+
+def message_directly_mentions_bot(
+    message: dict,
+    bot_name: str | None = None,
+    bot_user_id: int | None = None,
+) -> bool:
+    flags = message.get("flags")
+    if not isinstance(flags, list) or "mentioned" not in flags:
+        return False
+    user_id = strict_positive_int(ZULIP_BOT_USER_ID if bot_user_id is None else bot_user_id)
+    if user_id is not None:
+        for mentioned_user_id, name in _rendered_direct_mentions(message.get("_zulip_rendered_content")):
+            if mentioned_user_id == user_id:
+                message["_zulip_mention_name"] = name
+                return True
+        return False
+    pattern = _bot_mention_pattern(ZULIP_BOT_NAME if bot_name is None else bot_name)
+    return bool(pattern is not None and pattern.search(str(message.get("content") or "")))
+
+
+def verify_live_direct_mention(
+    rc: dict[str, str],
+    message: dict,
+    bot_user_id: int | None = None,
+) -> bool:
+    message_id = strict_positive_int(message.get("id"))
+    user_id = strict_positive_int(ZULIP_BOT_USER_ID if bot_user_id is None else bot_user_id)
+    if message_id is None or user_id is None:
+        raise ReplyRoutingError("Zulip bot mention identity is unavailable")
+
+    def same_revision(candidate: object) -> bool:
+        candidate_topic = (
+            candidate.get("subject") if isinstance(candidate, dict) and candidate.get("subject") is not None
+            else candidate.get("topic") if isinstance(candidate, dict)
+            else None
+        )
+        expected_topic = message.get("subject") if message.get("subject") is not None else message.get("topic")
+        return bool(
+            isinstance(candidate, dict)
+            and strict_positive_int(candidate.get("id")) == message_id
+            and candidate.get("type") == message.get("type")
+            and strict_positive_int(candidate.get("stream_id")) == strict_positive_int(message.get("stream_id"))
+            and candidate_topic == expected_topic
+            and strict_positive_int(candidate.get("sender_id")) == strict_positive_int(message.get("sender_id"))
+            and str(candidate.get("sender_email") or "").strip().casefold()
+            == str(message.get("sender_email") or "").strip().casefold()
+            and candidate.get("sender_is_bot") == message.get("sender_is_bot")
+            and candidate.get("last_edit_timestamp") == message.get("last_edit_timestamp")
+        )
+
+    try:
+        payload = api(rc, "GET", f"/api/v1/messages/{message_id}")
+    except Exception as exc:
+        raise ReplyRoutingError(
+            f"origin message {message_id} mention metadata is unavailable ({exception_ref(exc)})",
+            retryable=retryable_zulip_failure(exc),
+        ) from exc
+    rendered = payload.get("message") if isinstance(payload, dict) else None
+    if not same_revision(rendered) or not isinstance(rendered.get("content"), str):
+        raise ReplyRoutingError(f"origin message {message_id} mention metadata is ambiguous", retryable=True)
+    verified = {
+        **message,
+        "_zulip_rendered_content": rendered["content"],
+        "flags": rendered.get("flags"),
+    }
+    if not message_directly_mentions_bot(verified, bot_user_id=user_id):
+        return False
+    try:
+        raw_payload = api(
+            rc,
+            "GET",
+            f"/api/v1/messages/{message_id}",
+            params={"apply_markdown": "false"},
+        )
+    except Exception as exc:
+        raise ReplyRoutingError(
+            f"origin message {message_id} raw mention source is unavailable ({exception_ref(exc)})",
+            retryable=retryable_zulip_failure(exc),
+        ) from exc
+    raw = raw_payload.get("message") if isinstance(raw_payload, dict) else None
+    if (
+        not same_revision(raw)
+        or not isinstance(raw.get("content"), str)
+        or raw["content"] != message.get("content")
+    ):
+        raise ReplyRoutingError(f"origin message {message_id} mention revision changed", retryable=True)
+    message["_zulip_rendered_content"] = rendered["content"]
+    message["_zulip_mention_name"] = verified.get("_zulip_mention_name", "")
+    message["flags"] = rendered.get("flags")
+    return True
 
 
 def effective_message_content(message: dict) -> str:
     content = str(message.get("content") or "")
-    pattern = _bot_mention_pattern(str(message.get("_zulip_bot_name") or BOT_NAME))
+    pattern = _bot_mention_pattern(
+        str(message.get("_zulip_mention_name") or message.get("_zulip_bot_name") or ZULIP_BOT_NAME),
+        strict_positive_int(message.get("_zulip_bot_user_id")) or ZULIP_BOT_USER_ID,
+    )
     return pattern.sub("", content, count=1).strip() if pattern is not None else content.strip()
 
 
@@ -3887,10 +4040,13 @@ def _thread_for_matching_anchors(rc: dict[str, str], state: dict, message: dict,
             message_id = strict_positive_int(raw_message_id)
             if message_id is None:
                 raise ReplyRoutingError(f"ambiguous Hermes message-anchor response for Zulip topic {stream_id}/{topic}")
-            if matched is True or isinstance(matched, dict):
-                batch_matches.add(message_id)
-            elif matched is not False:
+            if not (
+                isinstance(matched, dict)
+                and isinstance(matched.get("match_content"), str)
+                and isinstance(matched.get("match_subject"), str)
+            ):
                 raise ReplyRoutingError(f"ambiguous Hermes message-anchor response for Zulip topic {stream_id}/{topic}")
+            batch_matches.add(message_id)
         matched_anchors.update(batch_matches)
     return _unique_owner(
         (thread_id for anchor in matched_anchors for thread_id in anchors[anchor]),
@@ -4496,7 +4652,9 @@ def _validated_generation_origin(rc: dict[str, str], message: dict) -> dict:
     if (
         REQUIRE_MENTION
         and not message.get("_zulip_is_steering")
-        and not message_directly_mentions_bot(origin, str(message.get("_zulip_bot_name") or BOT_NAME))
+        and not verify_live_direct_mention(
+            rc, origin, strict_positive_int(message.get("_zulip_bot_user_id")) or ZULIP_BOT_USER_ID
+        )
     ):
         raise ReplyRoutingError(f"origin message {message.get('id')} no longer mentions the Zulip bot")
     conversation = message.get("_zulip_bridge")
@@ -4747,7 +4905,14 @@ def refresh_generation_origin(rc: dict[str, str], message: dict) -> dict:
     origin = _validated_generation_origin(rc, message)
     reservation = ensure_reply_destination_owner(rc, message, origin, reserve=True)
     try:
-        for field in ("content", "sender_email", "sender_full_name", "sender_is_bot"):
+        for field in (
+            "content",
+            "sender_email",
+            "sender_full_name",
+            "sender_is_bot",
+            "_zulip_rendered_content",
+            "_zulip_mention_name",
+        ):
             if field in origin:
                 message[field] = origin[field]
         update_origin_location(message, origin)
@@ -6506,18 +6671,41 @@ def handle_message(
 
 
 def main(*, lock: HeldProcessLock | None = None, launcher_proof: LauncherProof | None = None) -> int:
-    rc = load_rc()
+    previous_sigterm = None
+    previous_sigint = None
+
+    def request_startup_shutdown(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    if threading.current_thread() is threading.main_thread():
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+        previous_sigint = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGTERM, request_startup_shutdown)
+        signal.signal(signal.SIGINT, request_startup_shutdown)
     try:
+        rc = load_rc()
         if lock is not None:
             lock.validate(lock.state_path)
+            if REQUIRE_MENTION:
+                refresh_zulip_bot_identity(rc)
             return _main(lock.state_path, launcher_proof, rc) if launcher_proof is not None else _main(lock.state_path, rc=rc)
         launcher_proof = launcher_proof or _python_console_script(str(HERMES))
         freeze_auxiliary_paths(STATE_PATH)
         with process_lock() as held_lock:
+            if REQUIRE_MENTION:
+                refresh_zulip_bot_identity(rc)
             return _main(held_lock.state_path, launcher_proof, rc)
+    except KeyboardInterrupt:
+        log("bridge_shutdown_requested")
+        return 0
     except ProcessLockError as exc:
         log("bridge_lock_failed")
         raise SystemExit(terminal_safe(exc)) from None
+    finally:
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+        if previous_sigint is not None:
+            signal.signal(signal.SIGINT, previous_sigint)
 
 
 def _main(
@@ -6929,11 +7117,16 @@ def _main(
                             ignored.append(mid)
                             continue
                         message["_zulip_is_steering"] = True
+                    elif REQUIRE_MENTION and not verify_live_direct_mention(rc, message):
+                        release_destination_reservation(state, reservation)
+                        ignored.append(mid)
+                        continue
                     elif not message_can_activate(message):
                         release_destination_reservation(state, reservation)
                         ignored.append(mid)
                         continue
-                    message["_zulip_bot_name"] = BOT_NAME
+                    message["_zulip_bot_name"] = ZULIP_BOT_NAME
+                    message["_zulip_bot_user_id"] = ZULIP_BOT_USER_ID
                     prepared.append((message, session_id, conversation, reservation))
                 except ReplyRoutingError as exc:
                     log("session_route_failed", mid, exception_ref(exc))

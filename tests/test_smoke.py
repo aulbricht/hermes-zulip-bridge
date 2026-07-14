@@ -19,6 +19,10 @@ def zulip_success(**payload: object) -> dict:
     return {"result": "success", "msg": "", **payload}
 
 
+def narrow_match(content: str = "", subject: str = "Smoke") -> dict[str, str]:
+    return {"match_content": content, "match_subject": subject}
+
+
 def stream_message(
     message_id: int,
     content: str,
@@ -502,6 +506,41 @@ class SmokeTests(unittest.TestCase):
             smoke.run(args)
         lock.assert_not_called()
 
+    def test_required_bot_identity_fails_before_smoke_state_is_loaded_or_saved(self) -> None:
+        args = argparse.Namespace(
+            stream="hermes",
+            topic="Smoke",
+            message="probe",
+            post_probe=False,
+            run_hermes=False,
+            human_origin_message_id=None,
+            post_reply=False,
+        )
+        load_state = mock.Mock()
+        save_state = mock.Mock()
+        api = mock.Mock(return_value=zulip_success(email="bot@example.com"))
+        with smoke.bridge.process_lock() as held_lock, mock.patch.multiple(
+            smoke.bridge,
+            REQUIRE_MENTION=True,
+            load_json=load_state,
+            save_json=save_state,
+            api=api,
+        ), self.assertRaisesRegex(SystemExit, "identity preflight failed"):
+            smoke.run(
+                args,
+                lock=held_lock,
+                hermes_launcher=mock.sentinel.launcher,
+                rc={"site": "https://example", "email": "bot@example.com", "key": "key"},
+            )
+
+        api.assert_called_once_with(
+            {"site": "https://example", "email": "bot@example.com", "key": "key"},
+            "GET",
+            "/api/v1/users/me",
+        )
+        load_state.assert_not_called()
+        save_state.assert_not_called()
+
     def test_smoke_process_lock_blocks_all_side_effects_then_releases(self) -> None:
         holder_code = """
 import sys
@@ -937,7 +976,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                     }
                 )
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"123": True})
+                return zulip_success(messages={"123": narrow_match()})
             raise AssertionError(path)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1159,7 +1198,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                     }
                 )
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"456": True})
+                return zulip_success(messages={"456": narrow_match()})
             if method == "POST" and path == "/api/v1/messages":
                 data = dict(kwargs.get("data") or {})
                 if data.get("content") == "probe":
@@ -1244,7 +1283,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                     )
                 )
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"456": True})
+                return zulip_success(messages={"456": narrow_match()})
             if method == "GET" and path == "/api/v1/messages":
                 return zulip_success(ignored_parameters_unsupported=[], messages=[])
             raise AssertionError((method, path, kwargs))
@@ -1338,7 +1377,7 @@ with bridge.process_lock(Path(sys.argv[1])):
 
                 def fake_api(_rc: dict[str, str], method: str, path: str, **kwargs: object) -> dict:
                     if path == "/api/v1/users/me":
-                        return zulip_success(email="bot@example.com", user_id=99)
+                        return zulip_success(email="bot@example.com", user_id=99, full_name="Hermes")
                     if path == "/api/v1/streams":
                         return zulip_success(streams=[{"stream_id": 7, "name": "hermes"}])
                     if method == "POST" and path == "/api/v1/messages":
@@ -1438,7 +1477,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                     }
                 )
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"456": True})
+                return zulip_success(messages={"456": narrow_match()})
             if method == "POST" and path == "/api/v1/messages":
                 if (kwargs.get("data") or {}).get("content") == "probe":
                     return zulip_success(id=123)
@@ -1573,7 +1612,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                 return zulip_success(streams=[{"stream_id": 7, "name": "hermes"}])
             if path == "/api/v1/messages/matches_narrow":
                 matches += 1
-                return {"result": "success", "msg": "", "messages": {"10": True, "20": True}}
+                return {"result": "success", "msg": "", "messages": {"10": narrow_match(), "20": narrow_match()}}
             if method == "POST":
                 posts.append(dict(kwargs.get("data") or {}))
                 return zulip_success(id=123)

@@ -5,6 +5,7 @@ import http.server
 import io
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -22,6 +23,10 @@ from hermes_zulip_bridge import bridge, cli
 
 def zulip_success(**payload: object) -> dict:
     return {"result": "success", "msg": "", **payload}
+
+
+def narrow_match(content: str = "", subject: str = "Topic") -> dict[str, str]:
+    return {"match_content": content, "match_subject": subject}
 
 
 BOT_KEY = "generic-fixture-bot-key"
@@ -1012,12 +1017,43 @@ with bridge.process_lock(Path(sys.argv[1])):
 
     def test_bridge_main_uses_cli_held_lock_without_reacquiring(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(bridge, "STATE_PATH", Path(tmpdir) / "state"):
-            with bridge.process_lock() as held_lock, mock.patch.object(bridge, "load_rc", return_value={"site": "https://example", "email": "bot@example.com", "key": "key"}), mock.patch.object(bridge, "process_lock") as acquire, mock.patch.object(
+            with bridge.process_lock() as held_lock, mock.patch.object(bridge, "load_rc", return_value={"site": "https://example", "email": "bot@example.com", "key": "key"}) as load_rc, mock.patch.object(bridge, "process_lock") as acquire, mock.patch.object(
                 bridge, "_main", return_value=7
+            ), mock.patch.object(bridge, "refresh_zulip_bot_identity") as refresh, mock.patch.object(
+                bridge, "REQUIRE_MENTION", True
             ):
                 self.assertEqual(bridge.main(lock=held_lock), 7)
 
             acquire.assert_not_called()
+            refresh.assert_called_once_with(load_rc.return_value)
+
+    def test_bridge_main_restores_startup_signal_handlers_and_releases_lock(self) -> None:
+        for shutdown_signal in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=shutdown_signal), tempfile.TemporaryDirectory() as tmpdir:
+                state_path = Path(tmpdir) / "state.json"
+                original_sigterm = signal.getsignal(signal.SIGTERM)
+                original_sigint = signal.getsignal(signal.SIGINT)
+                worker = mock.Mock()
+
+                def interrupt(_rc: dict[str, str]) -> None:
+                    signal.raise_signal(shutdown_signal)
+
+                with mock.patch.multiple(
+                    bridge,
+                    STATE_PATH=state_path,
+                    REQUIRE_MENTION=True,
+                    load_rc=lambda: {"site": "https://example", "email": "bot@example.com", "key": "key"},
+                    freeze_auxiliary_paths=lambda _path: None,
+                    refresh_zulip_bot_identity=interrupt,
+                    _main=worker,
+                ):
+                    self.assertEqual(bridge.main(launcher_proof=mock.sentinel.launcher), 0)
+
+                self.assertIs(signal.getsignal(signal.SIGTERM), original_sigterm)
+                self.assertIs(signal.getsignal(signal.SIGINT), original_sigint)
+                worker.assert_not_called()
+                with bridge.process_lock(state_path):
+                    pass
 
     def test_bridge_main_uses_handed_off_lock_canonical_state_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1367,6 +1403,104 @@ with bridge.process_lock(Path(sys.argv[1])):
                     user_message(2, 7, "Topic"),
                 )
             )
+
+    def test_authenticated_bot_identity_drives_mentions_without_configured_name(self) -> None:
+        direct = user_message(1, 7, "Topic", content="@**Ops Bot** /status")
+        direct["flags"] = ["mentioned"]
+        direct["_zulip_rendered_content"] = (
+            '<p><span class="user-mention" data-user-id="99">@Ops Bot</span> /status</p>'
+        )
+        renamed = {
+            **direct,
+            "content": "@**Renamed Ops Bot** /status",
+            "_zulip_rendered_content": (
+                '<p><span class="user-mention" data-user-id="99">@Renamed Ops Bot</span> /status</p>'
+            ),
+        }
+        wrong_duplicate = {
+            **direct,
+            "content": "@**Ops Bot|100** /status",
+            "_zulip_rendered_content": (
+                '<p><span class="user-mention" data-user-id="100">@Ops Bot</span> /status</p>'
+            ),
+        }
+        group_and_wrong_duplicate = {
+            **direct,
+            "content": "@*operators* `@**Ops Bot**` /status",
+            "_zulip_rendered_content": (
+                '<p><span class="user-group-mention" data-user-group-id="5">@operators</span> '
+                '<code>@**Ops Bot**</code> /status</p>'
+            ),
+        }
+        quoted = {
+            **direct,
+            "_zulip_rendered_content": (
+                '<blockquote><span class="user-mention" data-user-id="99">@Ops Bot</span></blockquote>'
+            ),
+        }
+        silent = {
+            **direct,
+            "_zulip_rendered_content": (
+                '<p><span class="user-mention silent" data-user-id="99">Ops Bot</span> /status</p>'
+            ),
+        }
+
+        with mock.patch.multiple(
+            bridge,
+            ZULIP_BOT_NAME="Hermes",
+            ZULIP_BOT_USER_ID=None,
+            REQUIRE_MENTION=True,
+        ):
+            bridge.configure_zulip_bot_identity({"full_name": "Ops Bot", "user_id": 99})
+            self.assertTrue(bridge.message_can_activate(direct))
+            self.assertTrue(bridge.message_can_activate(renamed))
+            self.assertFalse(bridge.message_can_activate(wrong_duplicate))
+            self.assertFalse(bridge.message_can_activate(group_and_wrong_duplicate))
+            self.assertFalse(bridge.message_can_activate(quoted))
+            self.assertFalse(bridge.message_can_activate(silent))
+            self.assertEqual(bridge.effective_message_content(direct), "/status")
+            self.assertEqual(bridge.effective_message_content(renamed), "/status")
+
+    def test_live_mention_verification_uses_id_and_rejects_revision_mismatch(self) -> None:
+        raw = user_message(1, 7, "Topic", content="@**New Name** /status")
+        raw["flags"] = ["mentioned"]
+        rendered = {
+            **raw,
+            "content": '<p><span class="user-mention" data-user-id="99">@New Name</span> /status</p>',
+        }
+        with mock.patch.object(
+            bridge,
+            "api",
+            side_effect=[zulip_success(message=rendered), zulip_success(message=raw)],
+        ):
+            self.assertTrue(bridge.verify_live_direct_mention({}, raw, 99))
+        self.assertEqual(bridge.effective_message_content({**raw, "_zulip_bot_user_id": 99}), "/status")
+
+        edited = {**rendered, "last_edit_timestamp": 2}
+        api = mock.Mock(return_value=zulip_success(message=edited))
+        with mock.patch.object(bridge, "api", api), self.assertRaisesRegex(
+            bridge.ReplyRoutingError, "metadata is ambiguous"
+        ):
+            bridge.verify_live_direct_mention({}, {**raw, "last_edit_timestamp": 1}, 99)
+
+        changed_raw = {**raw, "content": "same timestamp, different body"}
+        with mock.patch.object(
+            bridge,
+            "api",
+            side_effect=[zulip_success(message=rendered), zulip_success(message=changed_raw)],
+        ), self.assertRaisesRegex(bridge.ReplyRoutingError, "mention revision changed"):
+            bridge.verify_live_direct_mention({}, raw, 99)
+
+
+    def test_incomplete_authenticated_bot_identity_fails_without_mutating_identity(self) -> None:
+        with mock.patch.multiple(
+            bridge,
+            ZULIP_BOT_NAME="Existing",
+            ZULIP_BOT_USER_ID=99,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "identity is incomplete"):
+                bridge.configure_zulip_bot_identity({"full_name": "", "user_id": 100})
+            self.assertEqual((bridge.ZULIP_BOT_NAME, bridge.ZULIP_BOT_USER_ID), ("Existing", 99))
 
     def test_slash_policy_denies_unauthorized_and_state_changing_commands_before_worker(self) -> None:
         worker = mock.Mock(return_value="ok")
@@ -2060,7 +2194,7 @@ with bridge.process_lock(Path(sys.argv[1])):
         def fake_api(_rc: dict, method: str, path: str, **kwargs: object) -> dict:
             self.assertEqual((method, path), ("GET", "/api/v1/messages/matches_narrow"))
             lookups.append(dict(kwargs.get("params") or {}))
-            return {"result": "success", "msg": "", "messages": {"50": True}}
+            return {"result": "success", "msg": "", "messages": {"50": narrow_match()}}
 
         message = {"id": 51, "type": "stream", "stream_id": 1, "display_recipient": "stream-1", "topic": "Renamed"}
         with mock.patch.object(bridge, "api", fake_api):
@@ -2087,7 +2221,7 @@ with bridge.process_lock(Path(sys.argv[1])):
         )
         renamed_message = user_message(50, 1, "Renamed")
         with mock.patch.object(
-            bridge, "api", return_value=zulip_success(messages={"40": True})
+            bridge, "api", return_value=zulip_success(messages={"40": narrow_match()})
         ):
             renamed_session, renamed = bridge.resolve_session(
                 renamed_message, {}, state, "example", {"site": "https://example"}
@@ -2097,7 +2231,7 @@ with bridge.process_lock(Path(sys.argv[1])):
 
         sibling = user_message(60, 1, "Original")
         with mock.patch.object(
-            bridge, "api", return_value=zulip_success(messages={"50": False})
+            bridge, "api", return_value=zulip_success(messages={})
         ):
             sibling_session, sibling_conversation = bridge.resolve_session(
                 sibling, {}, state, "example", {"site": "https://example"}
@@ -2117,7 +2251,7 @@ with bridge.process_lock(Path(sys.argv[1])):
         )
 
     def test_live_anchor_and_resolved_variants_preserve_topic_continuity(self) -> None:
-        for topic, matches in (("Renamed", {"40": True}), ("✔ Original", {"40": False})):
+        for topic, matches in (("Renamed", {"40": narrow_match()}), ("✔ Original", {})):
             with self.subTest(topic=topic):
                 state: dict = {"topic_sessions": {}}
                 original = self.seed_topic(
@@ -2147,7 +2281,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             "last_seen_message_id": 50,
         }
         before = json.loads(json.dumps(state))
-        api = mock.Mock(return_value={"result": "success", "msg": "", "messages": {"50": True}})
+        api = mock.Mock(return_value={"result": "success", "msg": "", "messages": {"50": narrow_match()}})
 
         with mock.patch.object(bridge, "api", api), self.assertRaisesRegex(bridge.ReplyRoutingError, "mixed Zulip realms"):
             bridge.resolve_session(
@@ -2174,7 +2308,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                 }
             },
         }
-        api = mock.Mock(return_value={"result": "success", "msg": "", "messages": {"50": True}})
+        api = mock.Mock(return_value={"result": "success", "msg": "", "messages": {"50": narrow_match()}})
 
         before = json.loads(json.dumps(state))
         with mock.patch.object(bridge, "api", api), self.assertRaisesRegex(bridge.ReplyRoutingError, "different Zulip realm"):
@@ -2360,7 +2494,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                     {"operator": "topic", "operand": "Renamed"},
                 ],
             )
-            return {"result": "success", "msg": "", "messages": {"50": True}}
+            return {"result": "success", "msg": "", "messages": {"50": narrow_match()}}
 
         steering = {"id": 51, "type": "stream", "stream_id": 2, "display_recipient": "stream-2", "topic": "Renamed", "content": "stop"}
         with mock.patch.object(bridge, "api", fake_api), mock.patch.object(bridge, "ALLOW_STREAM_IDS", {"1", "2"}):
@@ -2388,7 +2522,7 @@ with bridge.process_lock(Path(sys.argv[1])):
         def fake_api(_rc: dict, method: str, path: str, **kwargs: object) -> dict:
             self.assertEqual((method, path), ("GET", "/api/v1/messages/matches_narrow"))
             lookups.append(dict(kwargs.get("params") or {}))
-            return {"result": "success", "msg": "", "messages": {"1": True}}
+            return {"result": "success", "msg": "", "messages": {"1": narrow_match()}}
 
         message = {"id": 100, "type": "stream", "stream_id": 1, "display_recipient": "stream-1", "topic": "Renamed"}
         with mock.patch.object(bridge, "api", fake_api):
@@ -2444,7 +2578,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             self.assertEqual((method, path), ("GET", "/api/v1/messages/matches_narrow"))
             batch = list((kwargs.get("params") or {}).get("msg_ids") or [])
             batches.append(batch)
-            matches = {"1001": True} if 1001 in batch else {}
+            matches = {"1001": narrow_match()} if 1001 in batch else {}
             return {"result": "success", "msg": "", "messages": matches}
 
         message = {"id": 2000, "type": "stream", "stream_id": 1, "display_recipient": "stream-1", "topic": "Renamed"}
@@ -2492,7 +2626,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             nonlocal lookups
             lookups += 1
             self.assertEqual((method, path), ("GET", "/api/v1/messages/matches_narrow"))
-            return {"result": "success", "msg": "", "messages": {"50": True, "60": True}}
+            return {"result": "success", "msg": "", "messages": {"50": narrow_match(), "60": narrow_match()}}
 
         message = {"id": 70, "type": "stream", "stream_id": 1, "display_recipient": "stream-1", "topic": "Collision"}
         with mock.patch.object(bridge, "api", fake_api), self.assertRaises(bridge.ReplyRoutingError):
@@ -2621,7 +2755,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                 return_value={
                     "result": "success",
                     "msg": "",
-                    "messages": {"50": True},
+                    "messages": {"50": narrow_match()},
                     "ignored_parameters_unsupported": ignored,
                 }
             )
@@ -2917,7 +3051,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if method == "GET" and path == "/api/v1/messages/matches_narrow":
                 params = dict(kwargs.get("params") or {})
                 self.assertEqual(params["msg_ids"], [44, 60])
-                return {"result": "success", "msg": "", "messages": {"60": True}}
+                return {"result": "success", "msg": "", "messages": {"60": narrow_match()}}
             if method == "POST":
                 posts.append(dict(kwargs.get("data") or {}))
                 return zulip_success(id=900)
@@ -2981,7 +3115,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                     }
                 )
             if method == "GET" and path == "/api/v1/messages/matches_narrow":
-                return {"result": "success", "msg": "", "messages": {"44": True}}
+                return {"result": "success", "msg": "", "messages": {"44": narrow_match()}}
             raise AssertionError("session mismatch must fail before POST")
 
         with mock.patch.object(bridge, "api", fake_api), self.assertRaises(bridge.ReplyRoutingError):
@@ -3021,7 +3155,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if method == "GET" and path == "/api/v1/messages/matches_narrow":
                 anchor_started.set()
                 self.assertTrue(release_anchor.wait(1))
-                return {"result": "success", "msg": "", "messages": {"44": True}}
+                return {"result": "success", "msg": "", "messages": {"44": narrow_match()}}
             if method == "POST":
                 posts.append(dict(kwargs.get("data") or {}))
                 return zulip_success(id=900)
@@ -3097,7 +3231,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                     if method == "GET" and path == "/api/v1/messages/900":
                         return zulip_success(message=bot_message(900, 1, "Before"))
                     if method == "GET" and path == "/api/v1/messages/matches_narrow":
-                        return {"result": "success", "msg": "", "messages": {"44": True}}
+                        return {"result": "success", "msg": "", "messages": {"44": narrow_match()}}
                     if method == "POST" and path == "/api/v1/messages":
                         return zulip_success(id=900)
                     if method == "PATCH" and path == "/api/v1/messages/900":
@@ -5157,7 +5291,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                     message={"id": 44, "type": "stream", "stream_id": 1, "display_recipient": "stream-1", "topic": "After"}
                 )
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"44": True})
+                return zulip_success(messages={"44": narrow_match()})
             if method == "POST":
                 post_started.set()
                 self.assertTrue(release_post.wait(2))
@@ -5222,7 +5356,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                     message={**message, "stream_id": 1, "display_recipient": "stream-1", "topic": "Before"}
                 )
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"44": True})
+                return zulip_success(messages={"44": narrow_match()})
             raise AssertionError(path)
 
         def attachments(*_args: object) -> str:
@@ -5311,7 +5445,7 @@ with bridge.process_lock(Path(sys.argv[1])):
 
         with (
             mock.patch.object(bridge, "live_origin_message", return_value=origin),
-            mock.patch.object(bridge, "api", return_value=zulip_success(messages={"44": True})),
+            mock.patch.object(bridge, "api", return_value=zulip_success(messages={"44": narrow_match()})),
             mock.patch.object(bridge, "build_attachment_context", return_value=""),
             mock.patch.object(bridge, "topic_history", return_value=""),
             mock.patch.object(bridge, "_hermes_command", side_effect=MemoryError("prompt")),
@@ -5353,7 +5487,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                         message={"id": 44, "type": "stream", "stream_id": 1, "display_recipient": "stream-1", "topic": "Before"}
                     )
                 if path == "/api/v1/messages/matches_narrow":
-                    return zulip_success(messages={"44": True})
+                    return zulip_success(messages={"44": narrow_match()})
                 if method == "POST":
                     return zulip_success(id=900)
                 raise AssertionError((method, path))
@@ -5373,7 +5507,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                 if method == "GET" and path == "/api/v1/messages/900":
                     return zulip_success(message=bot_message(900, 1, "Before", stream="stream-1"))
                 if path == "/api/v1/messages/matches_narrow":
-                    return zulip_success(messages={"44": True})
+                    return zulip_success(messages={"44": narrow_match()})
                 if method == "PATCH":
                     return zulip_success()
                 raise AssertionError((method, path))
@@ -5422,7 +5556,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if method == "GET" and path == "/api/v1/messages/900":
                 return zulip_success(message=bot_message(900, 1, "Before", stream="stream-1"))
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"44": True})
+                return zulip_success(messages={"44": narrow_match()})
             if method == "POST":
                 posts += 1
                 return zulip_success(id=900)
@@ -5537,7 +5671,7 @@ with bridge.process_lock(Path(sys.argv[1])):
         client = SequenceZulipClient(
             [
                 {"result": "error", "msg": "unavailable", "code": "HTTP_ERROR", "status_code": 503},
-                zulip_success(messages={"50": True}),
+                zulip_success(messages={"50": narrow_match()}),
             ]
         )
         renamed = {
@@ -5962,7 +6096,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                 mock.patch.object(bridge, "load_alias_entries", return_value=[]),
                 mock.patch.object(bridge, "latest_messages", return_value=[message]),
                 mock.patch.object(bridge, "live_origin_message", side_effect=lambda _rc, _message: dict(message)),
-                mock.patch.object(bridge, "api", return_value=zulip_success(messages={"44": True})),
+                mock.patch.object(bridge, "api", return_value=zulip_success(messages={"44": narrow_match()})),
                 mock.patch.object(bridge, "handle_message", side_effect=worker),
                 mock.patch.object(bridge, "save_json", side_effect=lambda _path, value: snapshots.append(json.loads(json.dumps(value)))),
                 mock.patch.object(bridge.concurrent.futures, "ThreadPoolExecutor", ImmediateExecutor),
@@ -6035,7 +6169,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if method == "GET" and path == "/api/v1/messages/900":
                 return zulip_success(message=bot_message(900, 1, "Before", stream="stream-1"))
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"44": True})
+                return zulip_success(messages={"44": narrow_match()})
             if method == "POST":
                 posts += 1
                 posted = True
@@ -6267,7 +6401,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if path == "/api/v1/messages/44":
                 return zulip_success(message={**bot_message(44, 1, "Topic", stream="stream-1"), "sender_email": "user@example.com"})
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"44": True})
+                return zulip_success(messages={"44": narrow_match()})
             raise AssertionError((method, path))
 
         with (
@@ -6696,7 +6830,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                 return zulip_success(message=steering.copy())
             if path == "/api/v1/messages/matches_narrow":
                 events.append("owner")
-                return zulip_success(messages={"222": True})
+                return zulip_success(messages={"222": narrow_match()})
             raise AssertionError(path)
 
         with (
@@ -6802,7 +6936,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                     if path == "/api/v1/messages/222":
                         return zulip_success(message=live)
                     if path == "/api/v1/messages/matches_narrow":
-                        return zulip_success(messages={"222": True})
+                        return zulip_success(messages={"222": narrow_match()})
                     raise AssertionError(path)
 
                 with (
@@ -6848,7 +6982,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                     message=message if live_reads == 1 else {**message, "sender_id": 18}
                 )
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"222": True})
+                return zulip_success(messages={"222": narrow_match()})
             raise AssertionError(path)
 
         with (
@@ -6884,7 +7018,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if path == "/api/v1/messages/222":
                 return zulip_success(message=message.copy())
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"222": True})
+                return zulip_success(messages={"222": narrow_match()})
             raise AssertionError(path)
 
         with (
@@ -7130,7 +7264,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if path == "/api/v1/messages/900":
                 return zulip_success(message=bot_message(900, 1, "Before", stream="stream-1"))
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"44": True})
+                return zulip_success(messages={"44": narrow_match()})
             raise AssertionError((method, path))
 
         with mock.patch.object(bridge, "api", fake_api):
@@ -8282,7 +8416,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if method == "GET" and path == "/api/v1/messages/900":
                 return zulip_success(message=bot_message(900, 1, "After" if moved else "Before", stream="stream-1"))
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"44": True})
+                return zulip_success(messages={"44": narrow_match()})
             if method == "PATCH":
                 patches += 1
                 moved = True
@@ -8476,7 +8610,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                             message=user_message(44, stream_id, topic)
                         )
                     if path == "/api/v1/messages/matches_narrow":
-                        return zulip_success(messages={"44": True})
+                        return zulip_success(messages={"44": narrow_match()})
                     if method == "POST":
                         posts.append(kwargs.get("data") or {})
                         return zulip_success(id=900)
@@ -8525,7 +8659,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                     if path == "/api/v1/messages/44":
                         return zulip_success(message=user_message(44, 1, current))
                     if path == "/api/v1/messages/matches_narrow":
-                        return zulip_success(messages={"44": True})
+                        return zulip_success(messages={"44": narrow_match()})
                     if method == "POST":
                         posts.append(kwargs["data"])
                         return zulip_success(id=900)
@@ -8544,7 +8678,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if path == "/api/v1/messages/44":
                 return zulip_success(message=user_message(44, 1, "Before"))
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"44": True})
+                return zulip_success(messages={"44": narrow_match()})
             if method == "POST":
                 self.assertEqual(state["zulip_threads"][conversation["thread_id"]]["session_id"], "")
                 return zulip_success(id=900)
@@ -8570,7 +8704,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                     if path == "/api/v1/messages/44":
                         return zulip_success(message=user_message(44, 1, "After"))
                     if path == "/api/v1/messages/matches_narrow":
-                        return zulip_success(messages={"44": True})
+                        return zulip_success(messages={"44": narrow_match()})
                     if method == "POST":
                         posts()
                         return zulip_success(id=900)
@@ -8599,7 +8733,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if path == "/api/v1/messages/44":
                 return zulip_success(message=user_message(44, 1, "Before"))
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"44": True})
+                return zulip_success(messages={"44": narrow_match()})
             if method == "POST":
                 attempts += 1
                 if attempts == 1:
@@ -8625,7 +8759,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if path == "/api/v1/messages/44":
                 return zulip_success(message=user_message(44, 1, "Before"))
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"44": True})
+                return zulip_success(messages={"44": narrow_match()})
             if method == "POST":
                 error = RuntimeError("timeout")
                 error.__cause__ = bridge.ZulipResponseError("unknown", uncertain=True)
@@ -8843,7 +8977,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                 return {"streams": [{"stream_id": 1, "name": "stream-1"}]}
             if path == "/api/v1/messages/matches_narrow":
                 anchor_kwargs.append(dict(kwargs))
-                return zulip_success(messages={"44": True})
+                return zulip_success(messages={"44": narrow_match()})
             if path == "/api/v1/messages":
                 history_params.append(params)
                 content = "_raw history_" if params.get("apply_markdown") == "false" else "<p><em>history</em></p>"
@@ -10154,7 +10288,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if path == "/api/v1/messages/45":
                 return zulip_success(message=steering)
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"45": True})
+                return zulip_success(messages={"45": narrow_match()})
             raise AssertionError(path)
 
         sleeps = 0
@@ -10236,7 +10370,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if method == "GET" and path == "/api/v1/messages/900":
                 return zulip_success(message=bot_message(900, 1, sent_topic, stream="stream-1"))
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"44": True})
+                return zulip_success(messages={"44": narrow_match()})
             if method == "PATCH":
                 target = str((kwargs.get("data") or {})["topic"])
                 patches.append(target)
@@ -10746,7 +10880,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                 if path == "/api/v1/messages/44":
                     return zulip_success(message=user_message(44, 1, "Topic"))
                 if path == "/api/v1/messages/matches_narrow":
-                    return zulip_success(messages={"44": True})
+                    return zulip_success(messages={"44": narrow_match()})
                 if method == "POST":
                     posts += 1
                     return zulip_success(id=900)
@@ -10872,7 +11006,7 @@ with bridge.process_lock(Path(sys.argv[1])):
                     if path == "/api/v1/messages/44":
                         return zulip_success(message=user_message(44, 1, "Topic"))
                     if path == "/api/v1/messages/matches_narrow":
-                        return zulip_success(messages={"44": True})
+                        return zulip_success(messages={"44": narrow_match()})
                     if method == "POST" and path == "/api/v1/messages":
                         posts += 1
                         try:
@@ -10999,7 +11133,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if path == "/api/v1/messages/44":
                 return zulip_success(message=user_message(44, 1, "Topic"))
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"44": True})
+                return zulip_success(messages={"44": narrow_match()})
             if method == "POST" and path == "/api/v1/messages":
                 posts += 1
                 try:
@@ -11124,7 +11258,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if path == "/api/v1/messages/44":
                 return zulip_success(message=user_message(44, 1, "Topic"))
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"44": True})
+                return zulip_success(messages={"44": narrow_match()})
             if method == "POST":
                 posts += 1
                 return zulip_success(id=900)
@@ -11720,26 +11854,29 @@ with bridge.process_lock(Path(sys.argv[1])):
         )
         self.assertEqual([item["filename"] for item in links], ["file name.txt", "✓.png"])
 
-    def test_anchor_boolean_schema_routes_only_true_and_rejects_malformed_values(self) -> None:
+    def test_anchor_match_schema_accepts_only_current_detail_objects(self) -> None:
         state = {"topic_sessions": {}}
         first = self.seed_topic(state, message_id=50, stream_id=1, topic="One", session_id="s1")
         second = self.seed_topic(state, message_id=60, stream_id=1, topic="Two", session_id="s2")
         message = {"stream_id": 1, "topic": "Renamed"}
         with mock.patch.object(
-            bridge, "api", return_value=zulip_success(messages={"50": False, "60": True})
+            bridge, "api", return_value=zulip_success(messages={"60": narrow_match()})
         ):
             self.assertEqual(
                 bridge._thread_for_matching_anchors({}, state, message, "example"), second["thread_id"]
             )
-        with mock.patch.object(
-            bridge, "api", return_value=zulip_success(messages={"50": False, "60": False})
-        ):
-            self.assertEqual(bridge._thread_for_matching_anchors({}, state, message, "example"), "")
         with mock.patch.object(bridge, "api", return_value=zulip_success(messages={})):
             self.assertEqual(bridge._thread_for_matching_anchors({}, state, message, "example"), "")
         self.assertNotEqual(first["thread_id"], second["thread_id"])
 
-        for matches in ({"50": {}}, {"50": 1}, {"50": "true"}, {"999": True}):
+        for matches in (
+            {"50": {}},
+            {"50": True},
+            {"50": False},
+            {"50": 1},
+            {"50": "true"},
+            {"999": narrow_match()},
+        ):
             with self.subTest(matches=matches), mock.patch.object(
                 bridge, "api", return_value=zulip_success(messages=matches)
             ), self.assertRaises(bridge.ReplyRoutingError):
@@ -11813,7 +11950,7 @@ with bridge.process_lock(Path(sys.argv[1])):
             if path == "/api/v1/messages/44":
                 return zulip_success(message=user_message(44, 1, "Topic"))
             if path == "/api/v1/messages/matches_narrow":
-                return zulip_success(messages={"44": True})
+                return zulip_success(messages={"44": narrow_match()})
             if method == "POST":
                 posts += 1
                 return zulip_success(id=899 + posts)
